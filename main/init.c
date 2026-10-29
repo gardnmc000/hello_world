@@ -7,7 +7,6 @@
 
 #include "base.h"
 #include "esp_mac.h"
-#include "esp_mac.h"
 #include "esp_modem_config.h"
 #include "storage.h"
 #include "mgaudio.h"
@@ -152,10 +151,6 @@ void esp32_init() {
     gpio_set_level(MODEM_PWRKEY_PIN, 0);
     gpio_set_level(GSM_LVL_OE, 1);
 
-}
-
-
-void setup_modem_power_hw(void) {
 }
 
 void init_dte() {

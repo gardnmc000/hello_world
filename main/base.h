@@ -40,8 +40,6 @@
 #define SERVER_IP   "31.125.133.237"
 //  Was #define SERVER_PORT 3492
 #define SERVER_PORT 3590
-#define TOTAL_SIZE (500 * 1024)
-#define CHUNK_SIZE  1024
 #define BW_INITIAL_START_WAIT      (5 * 1000)          /*  5 seconds       */
 #define BW_BATCH_REPEAT_INTERVAL   (10 * 60 * 1000)    /*  10 Minutes      */
 #define BW_REPORTING_INTERVAL_MS   (60 * 60 * 1000)    /*  1 hour          */
@@ -72,11 +70,6 @@ struct BW_CONFIG {
     uint16_t reserved_1;
     uint16_t reserved_2;      
 };
-
-/*
- * Configure GPIO 9 as an output for the Modem Power Key
- */
-//void setup_modem_power_hw(void);
 
 /**
  * Toggles the EG915 Power state.
@@ -181,9 +174,6 @@ typedef enum    REPORTING_STATE {
 
 #define BW_REPORTING_DAY_HOUR       03  /*  The hour that dawn breaks daylight starts           */       
 #define BW_REPORTING_NIGHT_HOUR     25  /*  The hour that dusk breaks daylight end              */       
-
-//#define BW_SOCKSERVER_IP    "192.168.1.187"  31.125.133.237
-#define BW_SOCKSERVER_IP    "31.125.133.237"
 
 #define BW_TIME_PORT 37         // RFC 868 Time Protocol Port
 #define BW_SECONDS_1900_TO_1970 2208988800ULL

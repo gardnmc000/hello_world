@@ -472,69 +472,6 @@ void cleanup_modem_queues(void) {
     ESP_LOGI(MGNW_TAG, "Cleanup finished. Ready for safe reboot sequence.");
 }
 
-
-
-/**
- *  tcp_sender_task
- *  Waits for modem to enter ppp mode and then connects to the remote tcp node to send the block of data 
- */
-void tcp_time_task(void *pvParameters) {
-    
-    const char *time_server = "time.nist.gov"; 
-
-    ESP_LOGI(MGNW_TAG, "tcp_time_task started, waiting for IP address");
-
-    if (connection_sema == NULL) {
-        ESP_LOGE(MGNW_TAG, "Semaphore connection_sema not initialized!");
-        graceful_power_down();
-        reporting_state = reporting_state_idle;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    TickType_t wait_ticks = pdMS_TO_TICKS(
-        (BW_MAX_CONNECTION_TIMEOUT - 1) * BW_DELAY_INTERVAL);
-    if (xSemaphoreTake(connection_sema, wait_ticks) != pdTRUE) {
-        ESP_LOGW(MGNW_TAG, "Timed out waiting for an IP address for network time");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    reporting_state = reporting_state_syncingtime;
-    vTaskDelay(pdMS_TO_TICKS(500)); 
-    
-    printf("Fetching network time from %s...\n", time_server);
-    time_t net_time = get_network_time(time_server);
-
-    if (net_time != 0) {
-        printf("Network Time (Unix Epoch): %ld\n", (long)net_time);
-        printf("Readable Time: %s", ctime(&net_time));
-        struct timeval tv;
-        tv.tv_sec = net_time;           // Seconds since Jan 1, 1970 (Unix Epoch)
-        tv.tv_usec = 0;                 // Microseconds fraction
-        
-        // Apply time directly to the ESP32 system clock
-        if (settimeofday(&tv, NULL) == 0) {
-            ESP_LOGI("TIME", "System time successfully synchronized!");
-            
-            // Print and verify the new system time
-            time_t now;
-            time(&now);
-            ESP_LOGI("TIME", "Current UTC Time: %s", ctime(&now));
-        } else {
-            ESP_LOGE("TIME", "Failed to set system time using settimeofday");
-        }
-    } else {
-        printf("Could not retrieve network time.\n");
-    }
-    
-    graceful_power_down();
-    reporting_state = reporting_state_idle;
-    vTaskDelete(NULL);       
-
-
-}
-
 static bool connect_time_socket(int fd, const struct sockaddr *address, socklen_t address_length) {
     int original_flags = fcntl(fd, F_GETFL, 0);
     if (original_flags < 0 || fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) < 0) {

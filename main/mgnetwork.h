@@ -17,7 +17,6 @@
 /* Declare this in mgnetwork.h, which hello_world_main.c already includes. */
 esp_err_t initialize_modem_drivers(void);
 
-void tcp_time_task(void *pvParameters);
 void ensure_modem_off(void);
 void graceful_power_down(void);
 void check_modem_down(void);
