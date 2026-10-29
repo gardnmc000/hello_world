@@ -1,0 +1,6 @@
+# ESP-IDF specific ignores
+build/
+sdkconfig.old
+sdkconfig.backup
+managed_components/
+.venv/
