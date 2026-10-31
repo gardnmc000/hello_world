@@ -3,6 +3,7 @@
 #include "storage.h"
 #include "mgnetwork.h"
 #include "mgaudio.h"
+#include "esp_task_wdt.h"
 #include <time.h>
 
 SemaphoreHandle_t connection_sema = NULL; 
@@ -82,6 +83,14 @@ void app_main(void)
         graceful_power_down();
     }
 
+    /*  A hung task must reboot the unit, as nobody is on site to restart it  */
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = BW_WDT_TIMEOUT_MS,
+        .idle_core_mask = (1 << 0) | (1 << 1),
+        .trigger_panic = true,
+    };
+    ESP_ERROR_CHECK(esp_task_wdt_reconfigure(&wdt_config));
+
     if (xTaskCreate(handle_dev_state, "sampler", 8192, NULL, 6, NULL) != pdPASS) {
         ESP_LOGE(MAIN_TAG, "Failed to create sampling task");
         ESP_ERROR_CHECK(ESP_FAIL);
@@ -95,10 +104,14 @@ void app_main(void)
 
 static bool send_pending_files(void)
 {
+    /*  Only the first clip in the directory is retried, so one counter is enough  */
+    static char failing_file[256];
+    static int failed_attempts = 0;
     char filename[256];
     int result;
 
     while ((result = get_next_dir_entry(filename)) > 0) {
+        esp_task_wdt_reset();
         ESP_LOGI(MAIN_TAG, "Sending pending clip: %s", filename);
         sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
         if (sock < 0) {
@@ -107,13 +120,36 @@ static bool send_pending_files(void)
             return false;
         }
 
-        if (socket_send(filename) != 0) {
-            ESP_LOGE(MAIN_TAG, "Transfer failed; leaving %s pending", filename);
+        int sent = socket_send(filename);
+        if (sent == BW_SEND_NO_SERVER) {
+            ESP_LOGE(MAIN_TAG, "Server unavailable; leaving %s pending", filename);
             return false;
         }
+        if (sent == BW_SEND_FILE_FAILED) {
+            if (strcmp(filename, failing_file) != 0) {
+                strlcpy(failing_file, filename, sizeof(failing_file));
+                failed_attempts = 0;
+            }
+            failed_attempts++;
+            if (failed_attempts < BW_MAX_FILE_ATTEMPTS) {
+                ESP_LOGE(MAIN_TAG, "Transfer of %s failed (attempt %d/%d)",
+                         filename, failed_attempts, BW_MAX_FILE_ATTEMPTS);
+                return false;
+            }
+            ESP_LOGE(MAIN_TAG, "Deleting %s after %d failed attempts", filename, failed_attempts);
+            failing_file[0] = '\0';
+            failed_attempts = 0;
+            if (delete_clip(filename) != 0) {
+                return false;
+            }
+            continue;
+        }
         if (archive_clip(filename) != 0) {
-            ESP_LOGE(MAIN_TAG, "Failed to archive transferred file %s", filename);
-            return false;
+            /*  The server already has this clip, so only the local copy is lost  */
+            ESP_LOGE(MAIN_TAG, "Failed to archive %s; deleting it", filename);
+            if (delete_clip(filename) != 0) {
+                return false;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(BW_INTERCLIP_INTERVAL));
     }
@@ -125,6 +161,7 @@ static bool send_pending_files(void)
     ESP_LOGI(MAIN_TAG, "No more pending clips");
     return true;
 }
+
 
 static bool sync_network_time(void)
 {
@@ -159,9 +196,18 @@ void reporting_task(void *pvParameters)
     (void)pvParameters;
     TickType_t next_report = xTaskGetTickCount();
     const TickType_t report_interval = pdMS_TO_TICKS(BW_REPORTING_INTERVAL_MS);
+    const TickType_t feed_interval = pdMS_TO_TICKS(BW_WDT_FEED_INTERVAL_MS);
+
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
     for (;;) {
-        vTaskDelayUntil(&next_report, report_interval);
+        /*  The report interval can exceed the watchdog timeout, so wait in slices  */
+        for (TickType_t remaining = report_interval; remaining > 0; ) {
+            TickType_t wait = (remaining < feed_interval) ? remaining : feed_interval;
+            vTaskDelayUntil(&next_report, wait);
+            esp_task_wdt_reset();
+            remaining -= wait;
+        }
 
         char filename[256];
         int pending = get_next_dir_entry(filename);
@@ -180,6 +226,7 @@ void reporting_task(void *pvParameters)
             graceful_power_down();
             continue;
         }
+        esp_task_wdt_reset();
 
         /*  Wait here until connection is signalled  */
         while (connection_sema != NULL &&
@@ -200,11 +247,14 @@ void reporting_task(void *pvParameters)
             continue;
         }
 
+        esp_task_wdt_reset();
+
         ESP_LOGI(MAIN_TAG, "Connected; sending pending recordings");
         sync_network_time();
         if (!send_pending_files()) {
             ESP_LOGW(MAIN_TAG, "Some recordings remain pending until the next hourly check");
         }
+        esp_task_wdt_reset();
         graceful_power_down();
     }
 }
@@ -214,7 +264,10 @@ void handle_dev_state(void *pvParameters)
     (void)pvParameters;
     int tick_count = 0;
 
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+
     for (;;) {
+        esp_task_wdt_reset();
         bool hit = measure_burst_sample(tick_count++);
         if (hit) {
             gpio_set_level(LED_GREEN, LED_ON);

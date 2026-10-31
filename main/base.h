@@ -40,15 +40,32 @@
 #define SERVER_IP   "31.125.133.237"
 //  Was #define SERVER_PORT 3492
 #define SERVER_PORT 3590
-#define BW_INITIAL_START_WAIT      (5 * 1000)          /*  5 seconds       */
-#define BW_BATCH_REPEAT_INTERVAL   (10 * 60 * 1000)    /*  10 Minutes      */
-#define BW_REPORTING_INTERVAL_MS   (60 * 60 * 1000)    /*  1 hour          */
-#define BW_IP_EVENT_TIMEOUT        (2* 60 * 1000)      /*  2 Minutes       */
-#define BW_INTERCLIP_INTERVAL      (500)               /*  500 millisec    */
-#define BW_RESTART_INTERVAL        (1000)              /*  1 second        */
+#define BW_INITIAL_START_WAIT      (5 * 1000)           /*  5 seconds       */
+#define BW_BATCH_REPEAT_INTERVAL   (10 * 60 * 1000)     /*  10 Minutes      */
+//#define BW_REPORTING_INTERVAL_MS   (60 * 60 * 1000)   /*  1 hour          */
+#define BW_REPORTING_INTERVAL_MS   (120 * 1000)         /*  2 minutes       */
+#define BW_IP_EVENT_TIMEOUT        (2* 60 * 1000)       /*  2 Minutes       */
+#define BW_INTERCLIP_INTERVAL      (500)                /*  500 millisec    */
+#define BW_RESTART_INTERVAL        (1000)               /*  1 second        */
+
+
+#define BW_MAX_FILE_ATTEMPTS       3                    /*  Failed cycles before a clip is deleted  */
+#define BW_WDT_TIMEOUT_MS          (10 * 60 * 1000)     /*  10 Minutes; well above the longest modem start-up  */
+#define BW_WDT_FEED_INTERVAL_MS    (60 * 1000)          /*  1 Minute, while the reporter waits  */
+#define BW_MODEM_RESET_PULSE_MS    (500)                /*  PROVISIONAL: confirm against the EG915 hardware design guide  */
+#define BW_MODEM_BOOT_WAIT_MS      (30 * 1000)          /*  PROVISIONAL: set above the measured boot time  */
+#define BW_MODEM_SETTLE_MS         (8 * 1000)           /*  8 seconds after first AT response from boot  */
+#define BW_MODEM_POWER_ATTEMPTS    2                    /*  Reset then PWRKEY rounds in ensure_modem_on  */
+
+/*  socket_send() results  */
+#define BW_SEND_OK                 0
+#define BW_SEND_NO_SERVER          (-1)                 /*  Network problem, the file is not at fault  */
+#define BW_SEND_FILE_FAILED        (-2)                 /*  Server was reachable, but this file failed  */
+
 
 /*  Prototypes  */
 void pulse_modem_power(void);
+void pulse_modem_reset(void);
 void init_dte();
 //void init();
 void esp32_init();

@@ -213,11 +213,39 @@ void pulse_modem_power(void) {
     
     // Wait for the modem to actually boot or shut down
     ESP_LOGI(MGNW_TAG, "Waiting for modem state transition...");
-    vTaskDelay(pdMS_TO_TICKS(5000)); 
+    vTaskDelay(pdMS_TO_TICKS(5000));
+}
+
+/**
+ * Restarts a modem that is on, and should leave one that is off still off.
+ * Unlike PWRKEY this is not a toggle, so it is safe when the power state is unknown.
+ */
+void pulse_modem_reset(void) {
+    ESP_LOGI(MGNW_TAG, "Pulsing Modem RESET_N on GPIO %d...", MODEM_RESET_PIN);
+
+    // Pull Low (via inverter)
+    gpio_set_level(MODEM_RESET_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(BW_MODEM_RESET_PULSE_MS));
+
+    // Release High (via inverter)
+    gpio_set_level(MODEM_RESET_PIN, 0);
+}
+
+/*  Poll with AT until the modem answers or the boot time has passed  */
+static bool wait_for_modem_response(void) {
+    const TickType_t boot_wait = pdMS_TO_TICKS(BW_MODEM_BOOT_WAIT_MS);
+    TickType_t start = xTaskGetTickCount();
+
+    while ((xTaskGetTickCount() - start) < boot_wait) {
+        if (esp_modem_sync(dce) == ESP_OK) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    return false;
 }
 
 esp_err_t ensure_modem_on(void) {
-    const int max_power_retries = 5;
     esp_err_t err;
 
     /* The driver/netif must exist before esp_modem can inspect or change mode. */
@@ -264,19 +292,28 @@ esp_err_t ensure_modem_on(void) {
         log_modem_status("AT+CNUM");
     }
 
+    /* The STATUS pin is not available. Reset first: an answer means the modem was on,
+       so PWRKEY, which would turn it off, is only pulsed when reset gets no answer. */
     for (int attempt = 0;
-         modem_error != ESP_OK && attempt < max_power_retries;
+         modem_error != ESP_OK && attempt < BW_MODEM_POWER_ATTEMPTS;
          ++attempt) {
-        ESP_LOGW(MGNW_TAG, "Modem not responding; PWRKEY attempt %d/%d",
-                 attempt + 1, max_power_retries);
-        pulse_modem_power();
-        vTaskDelay(pdMS_TO_TICKS(8000));
-        modem_error = esp_modem_sync(dce);
+        ESP_LOGW(MGNW_TAG, "Modem not responding; recovery attempt %d/%d",
+                 attempt + 1, BW_MODEM_POWER_ATTEMPTS);
+        pulse_modem_reset();
+        if (!wait_for_modem_response()) {
+            pulse_modem_power();
+            if (!wait_for_modem_response()) {
+                continue;
+            }
+        }
+        modem_error = ESP_OK;
+        /* AT can answer before the SIM and network stack are ready */
+        vTaskDelay(pdMS_TO_TICKS(BW_MODEM_SETTLE_MS));
     }
 
     if (modem_error != ESP_OK) {
-        ESP_LOGE(MGNW_TAG, "Modem did not respond after mode recovery and %d power attempts: %s",
-                 max_power_retries, esp_err_to_name(modem_error));
+        ESP_LOGE(MGNW_TAG, "Modem did not respond after %d recovery attempts: %s",
+                 BW_MODEM_POWER_ATTEMPTS, esp_err_to_name(modem_error));
         return modem_error;
     }
 
@@ -321,24 +358,33 @@ void ensure_modem_off(void) {
     }
 }
 
+static bool send_modem_power_off(void) {
+    ESP_LOGI(MGNW_TAG, "Sending AT+QPOWD...");
+    if (esp_modem_at(dce, "AT+QPOWD=1", NULL, 5000) != ESP_OK) {
+        return false;
+    }
+    ESP_LOGI(MGNW_TAG, "Modem safely powered down via software.");
+    return true;
+}
+
 void graceful_power_down(void) {
     ESP_LOGI(MGNW_TAG, "Stopping modem and PPP network interface...");
     
     if (dce != NULL) {
-        if (esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND) == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+        /* Also fails when the modem was never in PPP mode, so the AT check below decides */
+        if (esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND) != ESP_OK) {
+            ESP_LOGW(MGNW_TAG, "Could not confirm exit from PPP mode.");
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
 
-            ESP_LOGI(MGNW_TAG, "Sending AT+QPOWD...");
-            esp_err_t err = esp_modem_at(dce, "AT+QPOWD=1", NULL, 5000);
-            if (err == ESP_OK) {
-                ESP_LOGI(MGNW_TAG, "Modem safely powered down via software.");
-            } else {
-                ESP_LOGW(MGNW_TAG, "No response to QPOWD, forcing hardware fallback.");
-                pulse_modem_power();
+        /* PWRKEY is a toggle and could turn on a modem that is already off, so it is
+           never used here. Reset recovers a hung modem and leaves one that is off alone. */
+        if (!send_modem_power_off()) {
+            ESP_LOGW(MGNW_TAG, "No response to QPOWD; resetting modem to find its state.");
+            pulse_modem_reset();
+            if (!wait_for_modem_response() || !send_modem_power_off()) {
+                ESP_LOGW(MGNW_TAG, "Modem still silent after reset; treating it as off.");
             }
-        } else {
-            ESP_LOGE(MGNW_TAG, "Could not exit PPP mode. Forcing hardware shutdown.");
-            pulse_modem_power();
         }
 
         uart_flush_input(MODEM_UART_PORT);

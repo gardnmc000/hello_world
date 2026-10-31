@@ -24,6 +24,8 @@ int get_next_dir_entry(char * filename);
 /*  Scan the output directory, and identify the index number for the first file encountered with a '.bin' extensions    */
 /*  Return the index number for use by the caller                                                                       */
 int archive_clip(char * filename);
+int delete_clip(const char * filename);
+
 void close_data_socket(void);
 int save_recording(const char *filespec, const void *pcm_data, size_t pcm_length);
 int read_adc_voltage_gpio8(void);

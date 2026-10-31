@@ -14,6 +14,7 @@
 #include "mgnetwork.h"
 #include <fcntl.h>
 #include "freertos/semphr.h"
+#include "esp_task_wdt.h"
 
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
@@ -155,7 +156,7 @@ void close_data_socket(void) {
 int socket_send(char *filename) {
     static const uint8_t signature[8] = {0x19, 0x57, 0x55, 0xaa, 0xc0, 0x03, 0xf0, 0x0f};
     struct timeval io_timeout = {.tv_sec = 15, .tv_usec = 0};
-    int result = -1;
+    int result = BW_SEND_NO_SERVER;
     int packet_number = 0;
     int offset = 0;
     uint16_t clip_len;
@@ -185,27 +186,28 @@ int socket_send(char *filename) {
     ESP_LOGI(STORAGE_TAG, "Connected to server using socket %d", sock);
 
     if (!send_all(sock, signature, sizeof(signature)) || 
-        !receive_exact(sock, rxbuffer, 16) ||
-        memcmp(rxbuffer, "CFG_", 4) != 0) 
+        !receive_exact(sock, rxbuffer, 5) ||
+        memcmp(rxbuffer, "READY", 5) != 0) 
     {
-        ESP_LOGE(STORAGE_TAG, "Server did not provide CFG_");
+        ESP_LOGE(STORAGE_TAG, "Server did not provide READY");
         goto cleanup;
     }
-    
-    memcpy(&clip_len, &rxbuffer[4], 2);
-    memcpy(&clip_interval, &rxbuffer[6], 2);
-    memcpy(&freq_slope, &rxbuffer[8], 2);
-    memcpy(&vol_threshold, &rxbuffer[10], 2);
-    memcpy(&reserved_1, &rxbuffer[12], 2);
-    memcpy(&reserved_2, &rxbuffer[14], 2);
-    bw_config.clip_len = clip_len;
-    bw_config.clip_interval = clip_interval;
-    bw_config.freq_slope = freq_slope;
-    bw_config.vol_threshold = vol_threshold;
-    bw_config.reserved_1 = reserved_1;
-    bw_config.reserved_2 = reserved_2;
-    
-    store_config(bw_config);        
+    result = BW_SEND_FILE_FAILED;
+
+    //    memcpy(&clip_len, &rxbuffer[4], 2);
+    //    memcpy(&clip_interval, &rxbuffer[6], 2);
+    //    memcpy(&freq_slope, &rxbuffer[8], 2);
+    //    memcpy(&vol_threshold, &rxbuffer[10], 2);
+    //    memcpy(&reserved_1, &rxbuffer[12], 2);
+    //    memcpy(&reserved_2, &rxbuffer[14], 2);
+    //    bw_config.clip_len = clip_len;
+    //    bw_config.clip_interval = clip_interval;
+    //    bw_config.freq_slope = freq_slope;
+    //    bw_config.vol_threshold = vol_threshold;
+    //    bw_config.reserved_1 = reserved_1;
+    //    bw_config.reserved_2 = reserved_2;
+    //    
+    //    store_config(bw_config);        
 
     size_t filename_length = strlen(filename);
     if (filename_length >= 64 ||
@@ -252,10 +254,12 @@ int socket_send(char *filename) {
         }
 
         offset += bytes_read;
+        /*  A slow link can take longer than the watchdog timeout to send one clip  */
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    result = 0;
+    result = BW_SEND_OK;
 
 cleanup:
     close_data_socket();
@@ -443,6 +447,28 @@ int archive_clip(char * filename) {
   return result;
 }
 
+
+int delete_clip(const char * filename) {
+  if (filename == NULL || strchr(filename, '/') != NULL || !lock_storage()) {
+    ESP_LOGE(STORAGE_TAG, "Invalid filename or unable to lock storage");
+    return -1;
+  }
+
+  char path[320];
+  int result = -1;
+  int length = snprintf(path, sizeof(path), "%s/%s", SD_MOUNT_POINT, filename);
+  if (length < 0 || length >= (int)sizeof(path)) {
+    ESP_LOGE(STORAGE_TAG, "Recording path is too long");
+  } else {
+    result = unlink(path);
+    if (result != 0) {
+      ESP_LOGE(STORAGE_TAG, "Failed to delete %s: errno %d", path, errno);
+    }
+  }
+  unlock_storage();
+  return result;
+}
+
 /*  Read 1024 bytes from specified file at 'offset' into data array  */
 int32_t read_pcm16_block(const char* fnam, int offset) {
 
@@ -479,8 +505,49 @@ int32_t read_pcm16_block(const char* fnam, int offset) {
   return (bytes_read);
 }
 
+/*  Timestamps can repeat when the clock is unsynced, so never reuse a pending or archived name.  */
+/*  A clash changes the prefix to E_ and then steps the seconds, keeping the length unchanged.    */
+/*  Must be called with storage locked.                                                           */
+static bool make_unique_recording_name(const char *filespec, char *name, size_t name_size)
+{
+  int name_length = snprintf(name, name_size, "%s", filespec);
+  if (name_length < 4 || name_length >= (int)name_size) {
+    return false;
+  }
+  int seconds = (name[name_length - 2] - '0') * 10 + (name[name_length - 1] - '0');
+
+  for (int attempt = 0; attempt <= 60; attempt++) {
+    if (attempt > 0) {
+      int stepped = (seconds + attempt - 1) % 60;
+      name[0] = 'E';
+      name[name_length - 2] = '0' + stepped / 10;
+      name[name_length - 1] = '0' + stepped % 10;
+    }
+
+    char pending_path[160];
+    char archive_path[160];
+    struct stat st;
+    int length = snprintf(pending_path, sizeof(pending_path), SD_MOUNT_POINT "/%s.wav", name);
+    if (length < 0 || length >= (int)sizeof(pending_path)) {
+      return false;
+    }
+    length = snprintf(archive_path, sizeof(archive_path), SD_MOUNT_POINT "/archive/%s.wav", name);
+    if (length < 0 || length >= (int)sizeof(archive_path)) {
+      return false;
+    }
+    if (stat(pending_path, &st) != 0 && stat(archive_path, &st) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+
+
 int save_recording(const char *filespec, const void *pcm_data, size_t pcm_length)
 {
+
+
   if (filespec == NULL || pcm_data == NULL || strchr(filespec, '/') != NULL ||
       pcm_length > UINT32_MAX - sizeof(wav_header_t) || !lock_storage()) {
     ESP_LOGE(STORAGE_TAG, "Invalid recording or unable to lock storage");
@@ -491,12 +558,20 @@ int save_recording(const char *filespec, const void *pcm_data, size_t pcm_length
   wav_header.data_chunk.subchunk_size = (uint32_t)pcm_length;
   wav_header.descriptor_chunk.chunk_size = (uint32_t)(pcm_length + sizeof(wav_header_t) - 8);
 
+ 
+  char unique_name[64];
+  if (!make_unique_recording_name(filespec, unique_name, sizeof(unique_name))) {
+    ESP_LOGE(STORAGE_TAG, "No unique recording name available for %s", filespec);
+    unlock_storage();
+    return -1;
+  }
+
   char temporary_path[160];
   char recording_path[160];
   int temporary_length = snprintf(temporary_path, sizeof(temporary_path),
-                                  SD_MOUNT_POINT "/%s.part", filespec);
+                                  SD_MOUNT_POINT "/%s.part", unique_name);
   int recording_length = snprintf(recording_path, sizeof(recording_path),
-                                  SD_MOUNT_POINT "/%s.wav", filespec);
+                                  SD_MOUNT_POINT "/%s.wav", unique_name);
   if (temporary_length < 0 || temporary_length >= (int)sizeof(temporary_path) ||
       recording_length < 0 || recording_length >= (int)sizeof(recording_path)) {
     ESP_LOGE(STORAGE_TAG, "Recording path is too long");
