@@ -51,7 +51,7 @@ static esp_err_t log_modem_status(const char *command)
 
 esp_err_t wait_for_cellular_ready(void)
 {
-    esp_err_t err = esp_modem_at(dce, "AT+CEREG=2\r", NULL, 3000);
+    esp_err_t err = esp_modem_at(dce, "AT+CEREG=2", NULL, 3000);
     if (err != ESP_OK) {
         ESP_LOGE(MGNW_TAG, "Failed to enable detailed registration reports: %s",
                  esp_err_to_name(err));
@@ -70,7 +70,7 @@ esp_err_t wait_for_cellular_ready(void)
         int reporting_mode;
         int registration_status;
 
-        err = esp_modem_at(dce, "AT+CEREG?\r", response, 3000);
+        err = esp_modem_at(dce, "AT+CEREG?", response, 3000);
         char *registration = strstr(response, "+CEREG:");
 
         if (err == ESP_OK && registration != NULL &&
@@ -120,7 +120,7 @@ esp_err_t wait_for_cellular_ready(void)
         char response[128] = {0};
         int attached = 0;
 
-        err = esp_modem_at(dce, "AT+CGATT?\r", response, 3000);
+        err = esp_modem_at(dce, "AT+CGATT?", response, 3000);
         char *attachment = strstr(response, "+CGATT:");
 
         if (err == ESP_OK && attachment != NULL &&
@@ -183,7 +183,7 @@ esp_err_t configure_quectel_eg915(esp_modem_dce_t *dce, esp_netif_t *esp_netif)
     // 4. Enable Roaming via Quectel-specific AT command configuration
     // Corrected to exactly 4 parameters: dce, command string, response buffer, timeout
     // Using NULL because we only care if the modem returns ESP_OK or a timeout/error
-    err = esp_modem_at(dce, "AT+QCFG=\"roamservice\",2\r", NULL, 1000);
+    err = esp_modem_at(dce, "AT+QCFG=\"roamservice\",2", NULL, 1000);
     if (err != ESP_OK) {
         ESP_LOGE(MGNW_TAG, "Failed to enable roaming via AT command: %s", esp_err_to_name(err));
         return err;
@@ -467,7 +467,7 @@ esp_err_t upgrade_modem_baud_rate(void)
 
     /* Querying the setting at the new rate also checks that communication works. */
     char response[128] = {0};
-    err = esp_modem_at(dce, "AT+IPR?\r", response, 2000);
+    err = esp_modem_at(dce, "AT+IPR?", response, 2000);
     if (err != ESP_OK) {
         ESP_LOGE(MGNW_TAG, "Modem did not respond at baud rate %d: %s",
                  TARGET_BAUD_RATE, esp_err_to_name(err));

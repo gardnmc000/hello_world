@@ -71,7 +71,7 @@ static const wav_header_t wav_header_template =
 };
      
 
-static bool send_all(int fd, const void *data, size_t length) {
+static bool send_buffer(int fd, const void *data, size_t length) {
     const uint8_t *bytes = data;
     size_t sent = 0;
 
@@ -153,18 +153,12 @@ void close_data_socket(void) {
     }
 }
 
-int socket_send(char *filename) {
+int send_file(char *filename) {
     static const uint8_t signature[8] = {0x19, 0x57, 0x55, 0xaa, 0xc0, 0x03, 0xf0, 0x0f};
     struct timeval io_timeout = {.tv_sec = 15, .tv_usec = 0};
     int result = BW_SEND_NO_SERVER;
     int packet_number = 0;
     int offset = 0;
-    uint16_t clip_len;
-    uint16_t clip_interval;
-    uint16_t freq_slope;
-    uint16_t vol_threshold;
-    uint16_t reserved_1;
-    uint16_t reserved_2;
 
     if (sock < 0 || filename == NULL || txbuffer == NULL || rxbuffer == NULL) {
         ESP_LOGE(STORAGE_TAG, "Invalid socket or transfer buffer");
@@ -185,7 +179,7 @@ int socket_send(char *filename) {
     vTaskDelay(pdMS_TO_TICKS(500));
     ESP_LOGI(STORAGE_TAG, "Connected to server using socket %d", sock);
 
-    if (!send_all(sock, signature, sizeof(signature)) || 
+    if (!send_buffer(sock, signature, sizeof(signature)) || 
         !receive_exact(sock, rxbuffer, 5) ||
         memcmp(rxbuffer, "READY", 5) != 0) 
     {
@@ -194,24 +188,9 @@ int socket_send(char *filename) {
     }
     result = BW_SEND_FILE_FAILED;
 
-    //    memcpy(&clip_len, &rxbuffer[4], 2);
-    //    memcpy(&clip_interval, &rxbuffer[6], 2);
-    //    memcpy(&freq_slope, &rxbuffer[8], 2);
-    //    memcpy(&vol_threshold, &rxbuffer[10], 2);
-    //    memcpy(&reserved_1, &rxbuffer[12], 2);
-    //    memcpy(&reserved_2, &rxbuffer[14], 2);
-    //    bw_config.clip_len = clip_len;
-    //    bw_config.clip_interval = clip_interval;
-    //    bw_config.freq_slope = freq_slope;
-    //    bw_config.vol_threshold = vol_threshold;
-    //    bw_config.reserved_1 = reserved_1;
-    //    bw_config.reserved_2 = reserved_2;
-    //    
-    //    store_config(bw_config);        
-
     size_t filename_length = strlen(filename);
     if (filename_length >= 64 ||
-        !send_all(sock, filename, filename_length) ||
+        !send_buffer(sock, filename, filename_length) ||
         !receive_exact(sock, rxbuffer, 2) ||
         memcmp(rxbuffer, "GO", 2) != 0) {
         ESP_LOGE(STORAGE_TAG, "Server rejected filename or did not provide GO");
@@ -232,7 +211,7 @@ int socket_send(char *filename) {
             }
             break;
         }
-        if (packet_number >= 500 || !send_all(sock, txbuffer, (size_t)bytes_read)) {
+        if (packet_number >= 500 || !send_buffer(sock, txbuffer, (size_t)bytes_read)) {
             ESP_LOGE(STORAGE_TAG, "Transfer failed or exceeded packet limit");
             goto cleanup;
         }
@@ -506,7 +485,7 @@ int32_t read_pcm16_block(const char* fnam, int offset) {
 }
 
 /*  Timestamps can repeat when the clock is unsynced, so never reuse a pending or archived name.  */
-/*  A clash changes the prefix to E_ and then steps the seconds, keeping the length unchanged.    */
+/*  A clash changes the prefix to E and then steps the seconds, keeping the length unchanged.     */
 /*  Must be called with storage locked.                                                           */
 static bool make_unique_recording_name(const char *filespec, char *name, size_t name_size)
 {

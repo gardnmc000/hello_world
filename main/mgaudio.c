@@ -75,14 +75,18 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
     /*  Required number of bytes per sample is 4 times the number of samples, as the i2s output is 32 bits  */
     uint32_t bytes_to_read = SAMPLE_BUFFER_SIZE * sizeof(int32_t);
     uint32_t bytes_read = 0, samples_read = 0, slope =0, max_slope = 0, attempt = 0, accum_slope = 0, max_volume = 0;
-    int32_t ticks_to_wait = 20,  cur_magnitude = 0,  prv_magnitude = 0;
+    int32_t millis_to_wait = 20,  cur_magnitude = 0,  prv_magnitude = 0;
     int  index;
     /*  HIST_DEPTH defines the cut-off duration of the high frequency block within the clip  */
     max_volume = 0;
+    /*  Idling overflows the DMA queue, leaving an old partial buffer ahead of newer audio.  */
+    /*  Discard one DMA buffer so that join is never scored.                                 */
+    i2s_channel_read(rx_handle, i2s_buff, 240 * sizeof(int32_t), (size_t *) &bytes_read, millis_to_wait);
     for (attempt = 0; attempt < HIST_DEPTH; attempt ++) {
         max_slope = 0;
+        uint32_t peak_index = 0;
         /*  read the entire contents of the I2S device buffer (typically 4096 32-bit words)  */
-        i2s_channel_read(rx_handle, i2s_buff, bytes_to_read, (size_t *) &bytes_read, ticks_to_wait);
+        i2s_channel_read(rx_handle, i2s_buff, bytes_to_read, (size_t *) &bytes_read, millis_to_wait);
         samples_read = bytes_read / sizeof(int32_t);
         /*  Compare each element in the sample with the previous element in the sample to determine the slope  */
         for (index=1; index < samples_read; index++) {                  
@@ -93,6 +97,7 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
             /*  Is this slope a record breaker?  */
             if (slope > max_slope) {
                 max_slope = slope;
+                peak_index = index;
             }
 
             if (abs_i32(cur_magnitude) > max_volume) {
@@ -101,6 +106,15 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
         }
         /*  Saturate rather than wrap, so the loudest input cannot produce a tiny score  */
         accum_slope = (max_slope > UINT32_MAX - accum_slope) ? UINT32_MAX : accum_slope + max_slope;
+
+        float slope_rms, freq_hz;
+
+        analyse_block(i2s_buff, samples_read, &slope_rms, &freq_hz);
+
+        //ESP_LOGI(TAG, "Block %d: Max Slope %08x, Slope RMS %.0f, Freq %.0f Hz", (int) attempt, (int) max_slope, slope_rms, freq_hz);
+        ESP_LOGI(TAG, "Block %d: Max Slope %08x at index %d, Slope RMS %.0f, Freq %.0f Hz", (int) attempt, (int) max_slope, (int) peak_index, slope_rms, freq_hz);
+
+
         //ESP_LOGI(TAG, "Max Delta:  %d", (int) max_slope);
     }
 
@@ -123,13 +137,37 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
     return (accum_slope / BW_DELTA_THRESHOLD); 
 }
 
+
+/*  @brief  Estimates the RMS slope and the power-weighted frequency of a sample block  */
+void analyse_block(const int32_t *buf, uint32_t samples, float *slope_rms, float *freq_hz) {
+    float prev = (float) buf[0], sum = 0, sum_sq = 0, diff_sq = 0;
+    uint32_t count = samples - 1;
+
+    for (uint32_t i = 1; i < samples; i++) {
+        float cur = (float) buf[i];
+        float diff = cur - prev;
+        diff_sq += diff * diff;
+        sum += cur;
+        sum_sq += cur * cur;
+        prev = cur;
+    }
+
+    float mean = sum / count;
+    float variance = sum_sq / count - mean * mean;      /*  Excludes the DC offset  */
+    *slope_rms = sqrtf(diff_sq / count);
+
+    float ratio = (variance > 0) ? *slope_rms / sqrtf(variance) : 0;
+    *freq_hz = (CONFIG_EXAMPLE_SAMPLE_RATE / M_PI) * asinf(fminf(ratio / 2, 1.0f));
+}
+
+
 /*  @brief  Builds an entire 16 bit PCM wav file  */
 void build_clip16(i2s_chan_handle_t rx_handle, const char * filespec)  {
 
     /*  Required number of bytes per sample is 4 times the number of samples, as the i2s output is 32 bits  */
     uint32_t bytes_to_read = SAMPLE_BUFFER_SIZE * sizeof(int32_t);
     uint32_t bytes_read = 0;
-    int32_t ticks_to_wait = 20;
+    int32_t millis_to_wait = 20;
     int counter = 0,  clip_size;
     bool read_active = true;
     /*  Typically = 4096 / 44100 = 0.0928 seconds or 10.8 samples per second  */
@@ -160,7 +198,7 @@ void build_clip16(i2s_chan_handle_t rx_handle, const char * filespec)  {
     /*  Capture nn blocks from the I2S interface  */
     while (read_active) {
         /*  read from the I2S device and immediately write to the RAM as is  */
-        err = i2s_channel_read(rx_handle, i2s_buff, bytes_to_read, (size_t *) &bytes_read, ticks_to_wait);
+        err = i2s_channel_read(rx_handle, i2s_buff, bytes_to_read, (size_t *) &bytes_read, millis_to_wait);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to read from I2S: %s", esp_err_to_name(err));
             break;

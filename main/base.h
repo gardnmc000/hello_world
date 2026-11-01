@@ -76,7 +76,7 @@ void reporting_task(void *pvParameters);
 void blip_led();
 bool measure_burst_sample(int count);
 char * get_next_record(void);
-int socket_send(char * filename);
+int send_file(char * filename);
 
 
 struct BW_CONFIG {

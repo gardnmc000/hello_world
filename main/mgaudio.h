@@ -41,6 +41,7 @@ void build_clip16(i2s_chan_handle_t rx_handle, const char * filespec);
 uint32_t get_max_slope(i2s_chan_handle_t rx_handle);
 void i2s_start(i2s_chan_handle_t rx_handle);
 void i2s_end (i2s_chan_handle_t rx_handle);
+void analyse_block(const int32_t *buf, uint32_t samples, float *slope_rms, float *freq_hz);
 
 #endif /* MAIN_MGAUDIO_H_ */
 

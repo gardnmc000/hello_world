@@ -52,12 +52,12 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, &on_ppp_status, NULL));
                                                
-    adc_val = read_adc_voltage_gpio8();
-    ESP_LOGI(MAIN_TAG, "ADC Value is:  %04x", adc_val);
                                                
     //  upgrade_modem_baud_rate();
     
     vTaskDelay(pdMS_TO_TICKS(BW_INITIAL_START_WAIT));
+    adc_val = read_adc_voltage_gpio8();
+    ESP_LOGI(MAIN_TAG, "ADC Value is:  %04x", adc_val);
 
     reporting_state = reporting_state_notime;
     ESP_LOGI(MAIN_TAG, "Synchronizing system time before sampling starts");
@@ -120,7 +120,7 @@ static bool send_pending_files(void)
             return false;
         }
 
-        int sent = socket_send(filename);
+        int sent = send_file(filename);
         if (sent == BW_SEND_NO_SERVER) {
             ESP_LOGE(MAIN_TAG, "Server unavailable; leaving %s pending", filename);
             return false;
@@ -322,8 +322,8 @@ static bool make_clip_filename(void)
         return false;
     }
 
-    int length = snprintf(filespec, sizeof(filespec), "D_%s_%02d%03d%02d%02d%02d",
-                          &szmac_addr[8], capture_timeinfo.tm_year - 100,
+    int length = snprintf(filespec, sizeof(filespec), "D%s%02d%03d%02d%02d%02d",
+                          &szmac_addr[6], capture_timeinfo.tm_year - 100,
                           capture_timeinfo.tm_yday, capture_timeinfo.tm_hour,
                           capture_timeinfo.tm_min, capture_timeinfo.tm_sec);
     if (length < 0 || (size_t)length >= sizeof(filespec)) {
