@@ -173,9 +173,14 @@ typedef enum    REPORTING_STATE {
 //#define CONFIG_MGEXAMPLE_SPI_SCLK_GPIO 18
 //#define CONFIG_MGEXAMPLE_SPI_CS_GPIO 5
 
-#define BW_DELTA_THRESHOLD 800000      /*  Audio (32-bit) trigger threshold                    */
+#define BW_DELTA_THRESHOLD 800000      /*  Audio (32-bit) trigger threshold (old rule)         */
+#define BW_MIN_BIRD_FREQ_HZ 2000.0f    /*  A block must read at least this frequency to be a bird */
+#define BW_BIRD_LEVEL_RATIO 1.5f       /*  A block's slope RMS must be this multiple of the noise floor */
+#define BW_MIN_NOISE_FLOOR  130000.0f  /*  Stops tiny sounds triggering at a very quiet site   */
+#define BW_FLOOR_FALL_RATE  0.2f       /*  Fraction of the gap closed per block when the level is below the floor */
+#define BW_FLOOR_RISE_RATE  1.005f     /*  Floor multiplier per block when the level is above the floor */
 #define BW_DELAY_INTERVAL  1000        /*  1 Second general delay macro                        */
-#define BW_RECORD_INTERVAL 100000       /*  100 seconds between recording each clip              */
+#define BW_RECORD_INTERVAL 10000      /*  100 Seconds after next recording after capturing    */
 #define BW_HIT_INTERVAL    300         /*  300ms pulse indicates recording took place          */
 #define BW_SYNC_INTERVAL    100        /*  100ms pulse indicates time synced ok                */
 #define BW_SAMPLE_INTERVAL 1000        /*  1 seconds between each test sample                  */
@@ -200,6 +205,7 @@ typedef enum    REPORTING_STATE {
 #define SAMPLE_BUFFER_SIZE  4096
 #define HIST_BUFFER_SIZE  10
 #define HIST_DEPTH        2
+#define BW_USE_NEW_RULE 1        /*  1 = new frequency rule, 0 = old slope rule  */
 
 #define CONFIG_EXAMPLE_SAMPLE_RATE 44100
 #define BYTE_RATE CONFIG_EXAMPLE_SAMPLE_RATE * 2

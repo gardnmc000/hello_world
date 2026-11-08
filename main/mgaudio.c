@@ -77,6 +77,9 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
     uint32_t bytes_read = 0, samples_read = 0, slope =0, max_slope = 0, attempt = 0, accum_slope = 0, max_volume = 0;
     int32_t millis_to_wait = 20,  cur_magnitude = 0,  prv_magnitude = 0;
     int  index;
+    /*  Tracked background level, kept between calls.  Zero until the first block has been measured  */
+    static float noise_floor = 0;
+    uint32_t bird_blocks = 0;
     /*  HIST_DEPTH defines the cut-off duration of the high frequency block within the clip  */
     max_volume = 0;
     /*  Idling overflows the DMA queue, leaving an old partial buffer ahead of newer audio.  */
@@ -107,12 +110,38 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
         /*  Saturate rather than wrap, so the loudest input cannot produce a tiny score  */
         accum_slope = (max_slope > UINT32_MAX - accum_slope) ? UINT32_MAX : accum_slope + max_slope;
 
+        /*  A failed read would otherwise measure as silence and drag the noise floor down  */
+        if (samples_read < 2) {
+            ESP_LOGE(TAG, "Block %d: Short I2S read of %d samples", (int) attempt, (int) samples_read);
+            continue;
+        }
+
         float slope_rms, freq_hz;
 
         analyse_block(i2s_buff, samples_read, &slope_rms, &freq_hz);
 
+        if (noise_floor == 0) {
+            noise_floor = slope_rms;
+        }
+
+        /*  A bird stands out from the current background, and is above the range of wind and traffic  */
+        bool bird = (slope_rms >= noise_floor * BW_BIRD_LEVEL_RATIO) && (freq_hz >= BW_MIN_BIRD_FREQ_HZ);
+        if (bird) {
+            bird_blocks++;
+        }
+
         //ESP_LOGI(TAG, "Block %d: Max Slope %08x, Slope RMS %.0f, Freq %.0f Hz", (int) attempt, (int) max_slope, slope_rms, freq_hz);
-        ESP_LOGI(TAG, "Block %d: Max Slope %08x at index %d, Slope RMS %.0f, Freq %.0f Hz", (int) attempt, (int) max_slope, (int) peak_index, slope_rms, freq_hz);
+        ESP_LOGI(TAG, "Block %d: Max Slope %08x at index %d, Slope RMS %.0f, Freq %.0f Hz, Floor %.0f, Bird %d", (int) attempt, (int) max_slope, (int) peak_index, slope_rms, freq_hz, noise_floor, (int) bird);
+
+        /*  Follow the background down quickly, but up slowly so sustained birdsong isn't absorbed  */
+        if (slope_rms < noise_floor) {
+            noise_floor += (slope_rms - noise_floor) * BW_FLOOR_FALL_RATE;
+        } else {
+            noise_floor *= BW_FLOOR_RISE_RATE;
+        }
+        if (noise_floor < BW_MIN_NOISE_FLOOR) {
+            noise_floor = BW_MIN_NOISE_FLOOR;
+        }
 
 
         //ESP_LOGI(TAG, "Max Delta:  %d", (int) max_slope);
@@ -134,7 +163,14 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
     }
     ESP_LOGI(TAG, "Acc Slope %08x, Acc DELTA: %d, Max Vol:  %08x, Right Shift: %d", (int) accum_slope, (int) (accum_slope / BW_DELTA_THRESHOLD), (int) max_volume, (int) right_shift);
     //dft_forward((int32_t *) &i2s_buff);
-    return (accum_slope / BW_DELTA_THRESHOLD); 
+    
+    if (BW_USE_NEW_RULE) {
+        return (bird_blocks);
+    }
+    else {    
+        /*  Old rule  */
+        return (accum_slope / BW_DELTA_THRESHOLD);
+    }
 }
 
 
@@ -209,8 +245,15 @@ void build_clip16(i2s_chan_handle_t rx_handle, const char * filespec)  {
         
         /*  Transcode the entire block from 32-bit to 16-bit on the fly.*/
         /*  (32- bit) b31 : b0  =>  (16-bit)  b15 : b0   note: sign is preserved b31:b23 are lost  */
+        /*  Clip at full scale, as masking a value outside the 16-bit range wraps it to the opposite sign  */
         for (index = 0; index < SAMPLE_BUFFER_SIZE; index ++) {
-            p_out_buff[counter * SAMPLE_BUFFER_SIZE + index] = (i2s_buff[index] >> right_shift) & 0xffff;
+            int32_t sample = i2s_buff[index] >> right_shift;
+            if (sample > INT16_MAX) {
+                sample = INT16_MAX;
+            } else if (sample < INT16_MIN) {
+                sample = INT16_MIN;
+            }
+            p_out_buff[counter * SAMPLE_BUFFER_SIZE + index] = (uint16_t) sample;
         }
         /*  Proceed to the next block from the I2S module  */
         if (counter < clip_size) {

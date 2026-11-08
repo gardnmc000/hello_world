@@ -82,6 +82,12 @@ void app_main(void)
         ESP_LOGW(MAIN_TAG, "Unable to start modem for startup time synchronization");
         graceful_power_down();
     }
+    
+    if (BW_USE_NEW_RULE) {
+            ESP_LOGI(MAIN_TAG, "Trigger rule: new");
+    } else {
+            ESP_LOGI(MAIN_TAG, "Trigger rule: old");
+    }
 
     /*  A hung task must reboot the unit, as nobody is on site to restart it  */
     esp_task_wdt_config_t wdt_config = {
@@ -95,10 +101,10 @@ void app_main(void)
         ESP_LOGE(MAIN_TAG, "Failed to create sampling task");
         ESP_ERROR_CHECK(ESP_FAIL);
     }
-    if (xTaskCreate(reporting_task, "reporter", 12288, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGE(MAIN_TAG, "Failed to create reporting task");
-        ESP_ERROR_CHECK(ESP_FAIL);
-    }
+//    if (xTaskCreate(reporting_task, "reporter", 12288, NULL, 5, NULL) != pdPASS) {
+//        ESP_LOGE(MAIN_TAG, "Failed to create reporting task");
+//        ESP_ERROR_CHECK(ESP_FAIL);
+//    }
     vTaskDelete(NULL);
 }
 
@@ -302,11 +308,19 @@ bool measure_burst_sample(int count) {
   /*  Determine the largest jump during this audio packet  */
   accum_delta = get_max_slope(rx_handle);
   
-  /*  accum_delta is the summed max slope of HIST_DEPTH buffers in units of BW_DELTA_THRESHOLD,
-      so record a clip when the average max slope per buffer reaches the threshold  */
-  if (accum_delta >= HIST_DEPTH) {
-    hit = true;
+  if (BW_USE_NEW_RULE) {
+    /*  New rule: accum_delta is the number of blocks that passed the bird test, and one is enough because a call can end partway through a burst  */
+    if (accum_delta >= 1) {
+        hit = true;
+    }
   }
+  else {
+      /*  Old rule: accum_delta is the summed max slope of HIST_DEPTH buffers in units of BW_DELTA_THRESHOLD, so record a clip when the average max slope per buffer reaches the threshold  */
+      if (accum_delta >= HIST_DEPTH) {
+          hit = true;
+      }
+  }
+
   //ESP_LOGI(MAIN_TAG, "Sample:  %d.  Acc Delta:  %d,  Hit: %d", count, (int)accum_delta, hit);
 
   return (hit);
