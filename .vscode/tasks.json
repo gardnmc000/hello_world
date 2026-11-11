@@ -1,0 +1,42 @@
+{
+    // Ctrl+Shift+B runs the default build task; Terminal > Run Task... lists the others.
+    // All tasks use ESP-IDF v5.3.1 through tools\idf.ps1, not the extension's selected version.
+    // Flash tasks find the serial port automatically when only one board is connected.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "IDF: Build",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/idf.ps1 build",
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": {
+                "base": "$gcc",
+                "fileLocation": ["autoDetect", "${workspaceFolder}/build"]
+            }
+        },
+        {
+            "label": "IDF: Flash",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/idf.ps1 flash",
+            "problemMatcher": []
+        },
+        {
+            "label": "IDF: Flash and Monitor",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/idf.ps1 flash monitor",
+            "problemMatcher": []
+        },
+        {
+            "label": "IDF: Monitor",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/idf.ps1 monitor",
+            "problemMatcher": []
+        },
+        {
+            "label": "IDF: Erase core dump",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/idf.ps1 erase-coredump",
+            "problemMatcher": []
+        }
+    ]
+}

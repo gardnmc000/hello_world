@@ -1,0 +1,24 @@
+# Bird Watch clip upload server (port 3590), run as a systemd user service.
+#
+# Install:  copy to ~/.config/systemd/user/ on the server, then
+#           systemctl --user daemon-reload && systemctl --user enable --now socksrvr
+# Logs:     journalctl --user -t socksrvr -f
+#           (-t, not -u: lines from short-lived upload processes are not always
+#           linked to the unit, but they always carry the identifier below)
+
+[Unit]
+Description=Bird Watch clip upload server (port 3590)
+After=network-online.target
+
+[Service]
+# Clips are saved in the working directory
+WorkingDirectory=/home/mike/bin
+# Line-buffered output, so each log line reaches the journal at once and
+# forked children do not repeat the parent's unwritten output
+ExecStart=/usr/bin/stdbuf -oL -eL /home/mike/bin/socksrvr.3590
+SyslogIdentifier=socksrvr
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
