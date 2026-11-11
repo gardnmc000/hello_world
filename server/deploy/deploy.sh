@@ -23,6 +23,10 @@ ssh "$HOST" 'mkdir -p ~/bw_server_src'
 scp -q -r "$SERVER_DIR/Makefile" "$SERVER_DIR/$NAME" "$HOST:bw_server_src/"
 ssh "$HOST" "cd ~/bw_server_src && make CXX=g++ LDFLAGS= build/$NAME"
 
+echo "== Updating the service definition"
+scp -q "$SERVER_DIR/deploy/$NAME.service" "$HOST:.config/systemd/user/$NAME.service"
+ssh "$HOST" 'systemctl --user daemon-reload'
+
 echo "== Swapping in the new binary"
 ssh "$HOST" bash -s <<EOF
 set -e
