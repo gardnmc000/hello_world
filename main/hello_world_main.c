@@ -39,9 +39,7 @@ struct sockaddr_in dest_addr;
 
 void app_main(void)
 {
-    /*  TESTING ONLY  */
-    abort();
-    
+   
     connection_sema = xSemaphoreCreateBinary();
     if (connection_sema == NULL) {
         ESP_LOGE(MAIN_TAG, "Failed to create modem connection semaphore");
