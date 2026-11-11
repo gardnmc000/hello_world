@@ -1,3 +1,12 @@
 {
-    "idf.currentSetup": "C:\\esp\\v6.1\\esp-idf"
+    "idf.currentSetup": "C:\\esp\\v6.1\\esp-idf",
+
+    // Terminal > New Terminal, then pick "ESP-IDF 5.3.1" from the drop-down next to +
+    "terminal.integrated.profiles.windows": {
+        "ESP-IDF 5.3.1": {
+            "path": "powershell.exe",
+            "args": ["-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ". '${workspaceFolder}\\tools\\idf-env.ps1'"],
+            "icon": "chip"
+        }
+    }
 }

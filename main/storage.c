@@ -592,6 +592,29 @@ int save_recording(const char *filespec, const void *pcm_data, size_t pcm_length
  * @brief Reads the voltage from GPIO 8 (ADC1 Channel 7) in millivolts.
  * @return int Voltage in mV, or -1 on failure.
  */
+static int s_battery_load_min_mv = 0;
+
+void battery_load_reset(void)
+{
+    s_battery_load_min_mv = 0;
+}
+
+void battery_load_sample(void)
+{
+    int pin_mv = read_adc_voltage_gpio8();
+    if (pin_mv > 0) {
+        int battery_mv = pin_mv * 2;     /*  50/50 divider  */
+        if (s_battery_load_min_mv == 0 || battery_mv < s_battery_load_min_mv) {
+            s_battery_load_min_mv = battery_mv;
+        }
+    }
+}
+
+int battery_load_min_mv(void)
+{
+    return s_battery_load_min_mv;
+}
+
 int read_adc_voltage_gpio8(void)
 {
     int voltage = -1;

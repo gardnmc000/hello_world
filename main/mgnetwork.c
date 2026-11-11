@@ -5,6 +5,7 @@
  *      Author: gardn
  */
 #include "mgnetwork.h"
+#include "storage.h"
 #include "esp_err.h"
 #include <fcntl.h>
 
@@ -64,6 +65,7 @@ esp_err_t wait_for_cellular_ready(void)
     const TickType_t poll_interval = pdMS_TO_TICKS(5000);
     TickType_t start = xTaskGetTickCount();
     bool registered = false;
+    battery_load_reset();
 
     while ((xTaskGetTickCount() - start) < registration_timeout) {
         char response[128] = {0};
@@ -89,7 +91,17 @@ esp_err_t wait_for_cellular_ready(void)
             ESP_LOGW(MGNW_TAG, "Could not parse AT+CEREG? response: %s", response);
         }
 
-        vTaskDelay(poll_interval);
+        /*  Registration is when the modem draws its current peaks; they are short,
+         *  so sample the battery often through the wait and keep the lowest  */
+        const TickType_t sample_interval = pdMS_TO_TICKS(100);
+        for (TickType_t waited = 0; waited < poll_interval; waited += sample_interval) {
+            battery_load_sample();
+            vTaskDelay(sample_interval);
+        }
+    }
+
+    if (battery_load_min_mv() > 0) {
+        ESP_LOGI(MGNW_TAG, "Battery under modem load: lowest %d mV", battery_load_min_mv());
     }
 
     if (!registered) {

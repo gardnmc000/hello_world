@@ -11,6 +11,7 @@
 #define BW_OTA_DONE_FILE      SD_MOUNT_POINT "/fw_inst.bin"    /*  Renamed to this once installed         */
 #define BW_OTA_BAD_FILE       SD_MOUNT_POINT "/fw_bad.bin"     /*  Renamed to this if it was rolled back  */
 #define BW_OTA_VALID_AFTER_MS (60 * 60 * 1000)                 /*  1 hour without a crash marks it valid  */
+#define BW_OTA_MAX_POWER_ROLLBACKS 3                           /*  Trials lost to power problems before a release is blocked  */
 
 /*  Call once at boot, before the other tasks start. Logs the running version, reports
  *  an earlier rollback, and starts the 1 hour timer if this firmware is on trial.     */
@@ -23,5 +24,9 @@ void ota_install_from_sd(void);
 /*  Marks firmware on trial as valid, which cancels the rollback. Safe to call at any
  *  time, from any task; it does nothing if the firmware is already valid.            */
 void ota_mark_valid(const char *reason);
+
+/*  True if this version failed a trial and must not be installed (or downloaded) again:
+ *  it crashed, or lost BW_OTA_MAX_POWER_ROLLBACKS trials to power problems.          */
+bool ota_version_blocked(const char *version);
 
 #endif /* MAIN_OTA_UPDATE_H_ */

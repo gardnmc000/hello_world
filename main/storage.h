@@ -29,6 +29,12 @@ int delete_clip(const char * filename);
 void close_data_socket(void);
 int save_recording(const char *filespec, const void *pcm_data, size_t pcm_length);
 int read_adc_voltage_gpio8(void);
+
+/*  Lowest battery voltage seen while the modem is busy. A worn battery can read
+ *  normally at rest and still sag far enough under modem load to cause brownouts.  */
+void battery_load_reset(void);
+void battery_load_sample(void);
+int  battery_load_min_mv(void);     /*  0 if no sample has been taken  */
 //void convert_wav16(const char * filespec);
 
 int store_config(struct BW_CONFIG cfg);
