@@ -4,6 +4,7 @@
 #include "mgnetwork.h"
 #include "mgaudio.h"
 #include "esp_task_wdt.h"
+#include "ota_update.h"
 #include <time.h>
 
 SemaphoreHandle_t connection_sema = NULL; 
@@ -38,14 +39,23 @@ struct sockaddr_in dest_addr;
 
 void app_main(void)
 {
+    /*  TESTING ONLY  */
+    abort();
+    
     connection_sema = xSemaphoreCreateBinary();
     if (connection_sema == NULL) {
         ESP_LOGE(MAIN_TAG, "Failed to create modem connection semaphore");
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
     
+    ota_boot_check();
+
     /* Global Core Subsystems Initialization (Run ONCE at boot) */
     esp32_init();
+
+    /*  Restarts the unit if it installs new firmware from the SD card  */
+    ota_install_from_sd();
+
     init_dte();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -176,6 +186,9 @@ static bool sync_network_time(void)
         ESP_LOGW(MAIN_TAG, "Network time synchronization failed");
         return false;
     }
+
+    /*  The modem, PPP and DNS all worked, so new firmware has proved it can connect  */
+    ota_mark_valid("network time received");
 
     struct timeval tv = {.tv_sec = network_time, .tv_usec = 0};
     if (settimeofday(&tv, NULL) != 0) {

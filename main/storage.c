@@ -12,6 +12,7 @@
 #include "storage.h"
 #include "format_wav.h"
 #include "mgnetwork.h"
+#include "ota_update.h"
 #include <fcntl.h>
 #include "freertos/semphr.h"
 #include "esp_task_wdt.h"
@@ -187,6 +188,7 @@ int send_file(char *filename) {
         goto cleanup;
     }
     result = BW_SEND_FILE_FAILED;
+    ota_mark_valid("server sent READY");
 
     size_t filename_length = strlen(filename);
     if (filename_length >= 64 ||
