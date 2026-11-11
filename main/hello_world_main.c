@@ -39,13 +39,13 @@ struct sockaddr_in dest_addr;
 
 void app_main(void)
 {
-   
+          
     connection_sema = xSemaphoreCreateBinary();
     if (connection_sema == NULL) {
         ESP_LOGE(MAIN_TAG, "Failed to create modem connection semaphore");
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
-    
+        
     ota_boot_check();
 
     /* Global Core Subsystems Initialization (Run ONCE at boot) */
@@ -65,8 +65,8 @@ void app_main(void)
     
     vTaskDelay(pdMS_TO_TICKS(BW_INITIAL_START_WAIT));
     adc_val = read_adc_voltage_gpio8();
-    ESP_LOGI(MAIN_TAG, "ADC Value is:  %04x", adc_val);
-
+    ESP_LOGI(MAIN_TAG, "Battery: %d mV (pin %d mV)", adc_val * 2, adc_val);
+     
     reporting_state = reporting_state_notime;
     ESP_LOGI(MAIN_TAG, "Synchronizing system time before sampling starts");
     if (ensure_modem_on() == ESP_OK) {
@@ -282,7 +282,7 @@ void handle_dev_state(void *pvParameters)
     int tick_count = 0;
 
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
-
+    
     for (;;) {
         esp_task_wdt_reset();
         bool hit = measure_burst_sample(tick_count++);

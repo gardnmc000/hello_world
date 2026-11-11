@@ -121,7 +121,8 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
         analyse_block(i2s_buff, samples_read, &slope_rms, &freq_hz);
 
         if (noise_floor == 0) {
-            noise_floor = slope_rms;
+            /*  The minimum applies from the first block, as it does after every update  */
+            noise_floor = fmaxf(slope_rms, BW_MIN_NOISE_FLOOR);
         }
 
         /*  A bird stands out from the current background, and is above the range of wind and traffic  */
