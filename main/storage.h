@@ -48,7 +48,6 @@ void battery_load_sample(void);
 int  battery_load_min_mv(void);     /*  0 if no sample has been taken  */
 //void convert_wav16(const char * filespec);
 
-int store_config(struct BW_CONFIG cfg);
 
 int32_t read_pcm16_block(const char * filespec,  int offset);
 

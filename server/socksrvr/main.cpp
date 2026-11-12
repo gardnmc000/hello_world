@@ -74,6 +74,8 @@ static bool valid_clip_name(const char *name, int length)
  *  unit -> server   HELLO (64)      "FWH1", id[8], version[32], battery mV (u16),
  *                                   flags (u16: bit 0 on trial, bits 8-15 reset reason),
  *                                   rolled-back version[16]
+ *                   FWH2 (72)       as FWH1 with "FWH2", then settings CRC (u32), refused (u8), 3 reserved
+ *  server -> unit   (FWH2 only)     "CFG0" (current, or no config.cfg) | "CFG1", length (u16), text
  *  server -> unit   OFFER (72)      "NONE" | "OFFR", version[32], size (u32), sha256[32]
  *  unit -> server   GET (8)         "GET1", offset (u32)
  *  server -> unit   image bytes from offset to the end, then close
@@ -82,6 +84,7 @@ static bool valid_clip_name(const char *name, int length)
  *  Firmware lives in $BW_FIRMWARE_DIR (default ~/firmware):
  *    bird_watch.bin   the signed image on offer
  *    devices.txt      optional rollout list: only these ids are offered it
+ *    config.cfg       settings for every unit (key=value), sent to FWH2 units
  *    status/<id>      the latest HELLO from each unit
  * ------------------------------------------------------------------------------ */
 
@@ -227,8 +230,44 @@ static const char *reset_reason_name(unsigned reason)
 	return reason < sizeof(names) / sizeof(names[0]) ? names[reason] : "unknown";
 }
 
+/* ------------------------------------------------------------------------------
+ *  Settings (FWH2 units, firmware 1.5.0 on): $BW_FIRMWARE_DIR/config.cfg, a key=value
+ *  text of at most CFG_MAX_TEXT bytes, one file for every unit. A unit reports the
+ *  CRC-32 of the text it applied; when that differs from this file's, the file is sent.
+ * ------------------------------------------------------------------------------ */
+
+#define CFG_MAX_TEXT 1024
+
+static uint32_t crc32_of(const unsigned char *p, size_t n)
+{
+	uint32_t crc = 0xFFFFFFFFu;
+	while (n--) {
+		crc ^= *p++;
+		for (int bit = 0; bit < 8; bit++) {
+			crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1u));
+		}
+	}
+	return ~crc;
+}
+
+/*  Reads config.cfg; returns its length, 0 if there is none, -1 if it is too long  */
+static long read_config(const char *dir, unsigned char *buf)
+{
+	char path[512];
+	snprintf(path, sizeof(path), "%s/config.cfg", dir);
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return 0;
+	}
+	size_t n = fread(buf, 1, CFG_MAX_TEXT, f);
+	bool too_long = (n == CFG_MAX_TEXT && fgetc(f) != EOF);
+	fclose(f);
+	return too_long ? -1 : (long) n;
+}
+
 static void write_status(const char *dir, const char *id, const char *ip, const char *version,
-                         unsigned battery_mv, unsigned flags, const char *rolled_back)
+                         unsigned battery_mv, unsigned flags, const char *rolled_back,
+                         const char *config_line)
 {
 	char path[512];
 	snprintf(path, sizeof(path), "%s/status", dir);
@@ -247,14 +286,22 @@ static void write_status(const char *dir, const char *id, const char *ip, const 
 	}
 	fprintf(f, "time=%s\nip=%s\nversion=%s\nbattery_mv=%u\non_trial=%u\nrolled_back=%s\nlast_reset=%s\n",
 	        when, ip, version, battery_mv, flags & 1u, rolled_back, reset_reason_name(flags >> 8));
+	fprintf(f, "%s", config_line);
 	fclose(f);
 }
 
 static void handle_firmware(int fd, const char *ip)
 {
-	unsigned char hello[FW_HELLO_LEN];
-	if (!recv_exact(fd, hello, sizeof(hello)) || memcmp(hello, "FWH1", 4) != 0) {
+	/*  FWH1 (64 bytes, firmware before 1.5.0) or FWH2 (72: adds the settings CRC)  */
+	unsigned char hello[FW_HELLO_LEN + 8];
+	if (!recv_exact(fd, hello, FW_HELLO_LEN) ||
+	    (memcmp(hello, "FWH1", 4) != 0 && memcmp(hello, "FWH2", 4) != 0)) {
 		printf("FW %s: no valid HELLO\n", ip);
+		return;
+	}
+	bool fwh2 = memcmp(hello, "FWH2", 4) == 0;
+	if (fwh2 && !recv_exact(fd, hello + FW_HELLO_LEN, 8)) {
+		printf("FW %s: incomplete HELLO\n", ip);
 		return;
 	}
 
@@ -276,7 +323,46 @@ static void handle_firmware(int fd, const char *ip)
 
 	char dir[400];
 	firmware_dir(dir, sizeof(dir));
-	write_status(dir, id, ip, version, battery_mv, flags, rolled_back);
+
+	/*  Settings: compare the unit's CRC with config.cfg's  */
+	unsigned char cfg[CFG_MAX_TEXT];
+	long cfg_len = fwh2 ? read_config(dir, cfg) : 0;
+	uint32_t unit_crc = fwh2 ? get_u32(hello + 64) : 0;
+	unsigned refused = fwh2 ? hello[68] : 0;
+	uint32_t file_crc = cfg_len > 0 ? crc32_of(cfg, (size_t) cfg_len) : 0;
+	bool send_cfg = cfg_len > 0 && unit_crc != file_crc;
+	char config_line[160];
+	if (!fwh2) {
+		snprintf(config_line, sizeof(config_line), "config=n/a (firmware before 1.5.0)\n");
+	} else {
+		snprintf(config_line, sizeof(config_line), "config=%08x\nconfig_refused=%u\nconfig_current=%s\n",
+		         unit_crc, refused,
+		         cfg_len < 0 ? "no (config.cfg too long; not sent)" :
+		         cfg_len == 0 ? "no config.cfg on the server" :
+		         send_cfg ? "no (sending it now)" : "yes");
+	}
+	if (cfg_len < 0) {
+		printf("FW %s: config.cfg is over %d bytes; not sent\n", id, CFG_MAX_TEXT);
+	}
+	write_status(dir, id, ip, version, battery_mv, flags, rolled_back, config_line);
+
+	if (fwh2) {
+		bool sent;
+		if (send_cfg) {
+			unsigned char head[6] = {'C', 'F', 'G', '1', (unsigned char) (cfg_len & 0xff), (unsigned char) (cfg_len >> 8)};
+			sent = send_all(fd, head, sizeof(head)) && send_all(fd, cfg, (size_t) cfg_len);
+			printf("FW %s: sent settings %08x (%ld bytes; unit had %08x, %u refused)\n",
+			       id, file_crc, cfg_len, unit_crc, refused);
+		} else {
+			sent = send_all(fd, "CFG0", 4);
+			if (refused > 0) {
+				printf("FW %s: settings %08x applied, but %u value(s) were refused\n", id, unit_crc, refused);
+			}
+		}
+		if (!sent) {
+			return;
+		}
+	}
 
 	unsigned char offer[FW_OFFER_LEN];
 	memset(offer, 0, sizeof(offer));

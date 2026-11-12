@@ -185,6 +185,26 @@ Notes:
 - To withdraw a release, delete `~/firmware/bird_watch.bin`; units are then told `NONE`.
   A unit already part-way through a download resumes it only if the same image returns.
 
+## 6c. Unit settings (from 1.5.0)
+
+One file for every unit, `~/firmware/config.cfg`, of `key=value` lines; see
+`server/config.cfg.example` for every setting, its default and its range. Publish with
+`bash server/deploy/release.sh config <file>`, which checks each value against the
+firmware's own table (`main/bw_settings.c`) and sends only the settings, without comments.
+
+- Units on 1.5.0+ send `FWH2`: the HELLO gains the CRC-32 of the settings text they last
+  applied and how many values they refused. When that CRC differs from `config.cfg`'s, the
+  server sends the file (`CFG1`, length, text) before the firmware offer; otherwise `CFG0`.
+  Units on 1.4.x send `FWH1` and see no change.
+- The unit checks each value against its range (out of range: the default is kept and
+  the refusal counted), stores the text in NVS and applies it at once; it is applied
+  again at every boot. Settings missing from the file take the compiled defaults.
+- `status/<id>` shows `config` (the unit's CRC), `config_refused` and `config_current`.
+- Clip length is limited to 10 s by the upload: the server's `OK###` acknowledgement
+  allows at most 999 packets of 1024 bytes.
+- Active hours are GMT, the unit's clock. Outside them the sampler does not listen;
+  reporting and firmware checks carry on.
+
 ## 6b. Testing a dropped download (test switch)
 
 `~/firmware/test_cutoff` holding a byte count (for example `300000`) makes the server

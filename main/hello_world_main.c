@@ -5,6 +5,7 @@
 #include "mgaudio.h"
 #include "esp_task_wdt.h"
 #include "ota_update.h"
+#include "bw_settings.h"
 #include <time.h>
 
 SemaphoreHandle_t connection_sema = NULL; 
@@ -28,7 +29,6 @@ int sock = -1;
 char *txbuffer;
 char *rxbuffer;
 int adc_val;
-struct BW_CONFIG bw_config;
 
 
 //extern EventGroupHandle_t s_wifi_event_group;
@@ -47,6 +47,9 @@ void app_main(void)
     }
         
     ota_boot_check();
+
+    /*  After ota_boot_check, which starts NVS: the settings last sent by the server  */
+    settings_init();
 
     /* Global Core Subsystems Initialization (Run ONCE at boot) */
     esp32_init();
@@ -100,12 +103,6 @@ void app_main(void)
         graceful_power_down();
     }
     
-    if (BW_USE_NEW_RULE) {
-            ESP_LOGI(MAIN_TAG, "Trigger rule: new");
-    } else {
-            ESP_LOGI(MAIN_TAG, "Trigger rule: old");
-    }
-
     /*  A hung task must reboot the unit, as nobody is on site to restart it  */
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms = BW_WDT_TIMEOUT_MS,
@@ -269,17 +266,19 @@ void reporting_task(void *pvParameters)
 {
     (void)pvParameters;
     TickType_t next_report = xTaskGetTickCount();
-    const TickType_t report_interval = pdMS_TO_TICKS(BW_REPORTING_INTERVAL_MS);
     const TickType_t feed_interval = pdMS_TO_TICKS(BW_WDT_FEED_INTERVAL_MS);
     /*  The startup connection has just checked for firmware  */
     TickType_t last_fw_check = xTaskGetTickCount();
-    /*  Not pdMS_TO_TICKS: it multiplies by the tick rate before dividing, which
-     *  overflows 32 bits above about 11.9 hours (24 hours came out as 8 minutes)  */
-    const TickType_t fw_check_interval = (TickType_t) (BW_OTA_CHECK_INTERVAL_MS / 1000) * configTICK_RATE_HZ;
 
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
     for (;;) {
+        /*  Both intervals come from the server's settings, read each cycle so a change
+         *  applies at the next wait. Worked in seconds, not with pdMS_TO_TICKS, which
+         *  overflows 32 bits above about 11.9 hours (24 hours came out as 8 minutes).  */
+        const TickType_t report_interval = (TickType_t) g_settings.reporting_interval_s * configTICK_RATE_HZ;
+        const TickType_t fw_check_interval = (TickType_t) g_settings.fw_check_interval_h * 3600 * configTICK_RATE_HZ;
+
         /*  Count the interval from the end of the last cycle. A fixed timetable would
          *  start the next connection at once whenever a long upload overran the
          *  interval, which costs a whole reconnection for nothing.  */
@@ -378,6 +377,8 @@ void handle_dev_state(void *pvParameters)
 
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
     
+    bool was_active = true;
+
     for (;;) {
         esp_task_wdt_reset();
         if (s_restart_for_update) {
@@ -385,6 +386,20 @@ void handle_dev_state(void *pvParameters)
             vTaskDelay(pdMS_TO_TICKS(500));   /*  Let the log drain  */
             esp_restart();
         }
+
+        /*  Outside the recording window nothing is sampled; reporting carries on  */
+        bool active = settings_recording_active();
+        if (active != was_active) {
+            ESP_LOGI(MAIN_TAG, "%s the recording window (%02u:00 to %02u:00 GMT)",
+                     active ? "Entering" : "Leaving",
+                     (unsigned) g_settings.active_start_hour, (unsigned) g_settings.active_end_hour);
+            was_active = active;
+        }
+        if (!active) {
+            vTaskDelay(pdMS_TO_TICKS(BW_WDT_FEED_INTERVAL_MS / 2));
+            continue;
+        }
+
         bool hit = measure_burst_sample(tick_count++);
         if (hit) {
             gpio_set_level(LED_GREEN, LED_ON);
@@ -394,18 +409,10 @@ void handle_dev_state(void *pvParameters)
                 ESP_LOGE(MAIN_TAG, "Unable to create timestamped filename; clip not recorded");
             }
             gpio_set_level(LED_GREEN, LED_OFF);
-            //  ESP_LOGI(MAIN_TAG, "Clip captured; sampling resumes in %3.1f seconds", (float)BW_RECORD_INTERVAL / 1000.0f);
-            vTaskDelay(pdMS_TO_TICKS(BW_RECORD_INTERVAL));
+            /*  Up to 600 s, which is under the 10-minute watchdog, so one wait is safe  */
+            vTaskDelay((TickType_t) g_settings.record_holdoff_s * configTICK_RATE_HZ);
         } else {
-            time_t now = time(NULL);
-            struct tm timeinfo;
-            if (localtime_r(&now, &timeinfo) == NULL) {
-                ESP_LOGE(MAIN_TAG, "Failed to convert current time for sampler log");
-                vTaskDelay(pdMS_TO_TICKS(BW_SAMPLE_INTERVAL));
-                continue;
-            }
-            //  ESP_LOGI(MAIN_TAG, "(%02d:%02d) No hit; sampling again in %3.1f seconds", timeinfo.tm_hour, timeinfo.tm_min, (float)BW_SAMPLE_INTERVAL / 1000.0f);
-            vTaskDelay(pdMS_TO_TICKS(BW_SAMPLE_INTERVAL));
+            vTaskDelay(pdMS_TO_TICKS(g_settings.sample_interval_ms));
         }
     }
 }
@@ -413,28 +420,9 @@ void handle_dev_state(void *pvParameters)
 
 /*  Read a burst of HIST_DEPTH samples from the i2s subsystem to check for consistent high frequency audio like bird sound  */
 bool measure_burst_sample(int count) {
-  bool hit = false;
-  uint32_t accum_delta = 0;
-
-  /*  Determine the largest jump during this audio packet  */
-  accum_delta = get_max_slope(rx_handle);
-  
-  if (BW_USE_NEW_RULE) {
-    /*  New rule: accum_delta is the number of blocks that passed the bird test, and one is enough because a call can end partway through a burst  */
-    if (accum_delta >= 1) {
-        hit = true;
-    }
-  }
-  else {
-      /*  Old rule: accum_delta is the summed max slope of HIST_DEPTH buffers in units of BW_DELTA_THRESHOLD, so record a clip when the average max slope per buffer reaches the threshold  */
-      if (accum_delta >= HIST_DEPTH) {
-          hit = true;
-      }
-  }
-
-  //ESP_LOGI(MAIN_TAG, "Sample:  %d.  Acc Delta:  %d,  Hit: %d", count, (int)accum_delta, hit);
-
-  return (hit);
+  (void) count;
+  /*  One block passing the bird test is enough, because a call can end partway through a burst  */
+  return get_max_slope(rx_handle) >= 1;
 }
 
 static bool make_clip_filename(void)

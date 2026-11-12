@@ -43,7 +43,7 @@
 #define BW_INITIAL_START_WAIT      (5 * 1000)           /*  5 seconds       */
 #define BW_BATCH_REPEAT_INTERVAL   (10 * 60 * 1000)     /*  10 Minutes      */
 //#define BW_REPORTING_INTERVAL_MS   (60 * 60 * 1000)   /*  1 hour          */
-#define BW_REPORTING_INTERVAL_MS   (120 * 1000)         /*  2 minutes       */
+#define BW_REPORTING_INTERVAL_MS   (120 * 1000)         /*  2 minutes; default for reporting_interval_s  */
 #define BW_IP_EVENT_TIMEOUT        (2* 60 * 1000)       /*  2 Minutes       */
 #define BW_INTERCLIP_INTERVAL      (500)                /*  500 millisec    */
 #define BW_RESTART_INTERVAL        (1000)               /*  1 second        */
@@ -78,15 +78,6 @@ bool measure_burst_sample(int count);
 char * get_next_record(void);
 int send_file(char * filename);
 
-
-struct BW_CONFIG {
-    uint16_t clip_len;
-    uint16_t clip_interval;
-    uint16_t freq_slope;
-    uint16_t vol_threshold;
-    uint16_t reserved_1;
-    uint16_t reserved_2;      
-};
 
 /**
  * Toggles the EG915 Power state.
@@ -173,26 +164,30 @@ typedef enum    REPORTING_STATE {
 //#define CONFIG_MGEXAMPLE_SPI_SCLK_GPIO 18
 //#define CONFIG_MGEXAMPLE_SPI_CS_GPIO 5
 
-#define BW_DELTA_THRESHOLD 800000      /*  Audio (32-bit) trigger threshold (old rule)         */
+/*  Defaults for the settings the server can change (see bw_settings.c for the
+ *  setting names and permitted ranges). Code reads g_settings, not these.  */
 #define BW_MIN_BIRD_FREQ_HZ 2000.0f    /*  A block must read at least this frequency to be a bird */
 #define BW_BIRD_LEVEL_RATIO 1.5f       /*  A block's slope RMS must be this multiple of the noise floor */
 #define BW_MIN_NOISE_FLOOR  130000.0f  /*  Stops tiny sounds triggering at a very quiet site   */
+#define BW_RECORD_INTERVAL 10000       /*  10 seconds' pause after recording a clip            */
+#define BW_SAMPLE_INTERVAL 1000        /*  1 second between each test sample                   */
+#define BW_DEFAULT_CLIP_LENGTH 5       /*  Clip length in seconds (up to 10: see send_file)    */
+
 #define BW_FLOOR_FALL_RATE  0.2f       /*  Fraction of the gap closed per block when the level is below the floor */
 #define BW_FLOOR_RISE_RATE  1.005f     /*  Floor multiplier per block when the level is above the floor */
 #define BW_DELAY_INTERVAL  1000        /*  1 Second general delay macro                        */
-#define BW_RECORD_INTERVAL 10000      /*  100 Seconds after next recording after capturing    */
 #define BW_HIT_INTERVAL    300         /*  300ms pulse indicates recording took place          */
 #define BW_SYNC_INTERVAL    100        /*  100ms pulse indicates time synced ok                */
-#define BW_SAMPLE_INTERVAL 1000        /*  1 seconds between each test sample                  */
-#define BW_DEFAULT_CLIP_LENGTH 5.0f    /*  Clip length is 5 seconds by defaul                  */
 
 #define BW_REPORTING_START_HOUR     02  /*  The hour of day that the call-home starts (currently ignored) */       
 #define BW_REPORTING_START_MINUTE   00  /*  The minute of the hour that the call-home starts    */       
 #define BW_REPORTING_END_HOUR       22  /*  The hour of day that the call-home ends             */       
 #define BW_REPORTING_END_MINUTE     05  /*  The minute at which the call home should expire     */
 
-#define BW_ACTIVE_START_HOUR        02  /*  The start of all daily activity                    */       
-#define BW_ACTIVE_END_HOUR          22  /*  The end of all daily activity                      */       
+/*  Recording window defaults (GMT): the whole day, so nothing changes until the
+ *  server sets active_start_hour / active_end_hour  */
+#define BW_ACTIVE_START_HOUR        0   /*  Recording starts at this hour                      */
+#define BW_ACTIVE_END_HOUR          24  /*  ...and stops at the start of this hour             */
 
 #define BW_REPORTING_DAY_HOUR       03  /*  The hour that dawn breaks daylight starts           */       
 #define BW_REPORTING_NIGHT_HOUR     25  /*  The hour that dusk breaks daylight end              */       
@@ -204,8 +199,7 @@ typedef enum    REPORTING_STATE {
 #define SD_MOUNT_POINT      "/sdcard"
 #define SAMPLE_BUFFER_SIZE  4096
 #define HIST_BUFFER_SIZE  10
-#define HIST_DEPTH        2
-#define BW_USE_NEW_RULE 1        /*  1 = new frequency rule, 0 = old slope rule  */
+#define HIST_DEPTH        2         /*  Blocks tested per burst; one passing the bird test is a hit  */
 
 #define CONFIG_EXAMPLE_SAMPLE_RATE 44100
 #define BYTE_RATE CONFIG_EXAMPLE_SAMPLE_RATE * 2

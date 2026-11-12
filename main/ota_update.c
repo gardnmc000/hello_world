@@ -17,6 +17,7 @@
 #include "base.h"
 #include "ota_update.h"
 #include "storage.h"
+#include "bw_settings.h"
 #include "esp_ota_ops.h"
 #include "esp_app_format.h"
 #include "esp_app_desc.h"
@@ -367,8 +368,9 @@ void ota_install_from_sd(void)
     /*  A power failure part-way through would be survived, but a flat battery
      *  would only lose the trial; wait for a charge. An ADC error does not block it.  */
     int battery_mv = read_adc_voltage_gpio8() * 2;
-    if (battery_mv > 0 && battery_mv < BW_OTA_MIN_BATTERY_MV) {
-        ESP_LOGW(OTA_TAG, "Battery %d mV is below %d mV; install postponed", battery_mv, BW_OTA_MIN_BATTERY_MV);
+    int min_mv = (int) g_settings.ota_min_battery_mv;
+    if (battery_mv > 0 && battery_mv < min_mv) {
+        ESP_LOGW(OTA_TAG, "Battery %d mV is below %d mV; install postponed", battery_mv, min_mv);
         fclose(f);
         return;
     }

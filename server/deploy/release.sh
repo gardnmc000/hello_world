@@ -19,6 +19,12 @@
 #   server/deploy/release.sh withdraw [-y]
 #       Removes the image; every unit is then told there is nothing new.
 #
+#   server/deploy/release.sh config <file.cfg> [-y]
+#       Publishes unit settings (see server/config.cfg.example). Every setting is
+#       checked against the names and ranges in main/bw_settings.c first. Units on
+#       1.5.0+ fetch it at their next connection. To put every unit back to its
+#       firmware defaults, publish a file with no settings in it (comments only).
+#
 # Unit ids are the 6 MAC hex digits in a unit's clip names, e.g. f30f1c.
 
 set -euo pipefail
@@ -28,6 +34,8 @@ FW_DIR=firmware                                   # relative to the server accou
 KEY=C:/Users/gardn/keys/bird_watch_signing.pem
 PYTHON=C:/Espressif/python_env/idf5.3_py3.11_env/Scripts/python.exe
 MAX_IMAGE=$((3 * 1024 * 1024))                    # one app partition
+MAX_CONFIG=1024                                   # BW_SETTINGS_MAX_TEXT in main/bw_settings.h
+SETTINGS_C="$(cd "$(dirname "$0")/../.." && pwd)/main/bw_settings.c"
 
 die()  { echo "release: $*" >&2; exit 1; }
 note() { echo "== $*"; }
@@ -86,6 +94,11 @@ else
     echo "Offered to: every unit (no devices.txt)"
 fi
 [ -f test_cutoff ] && echo "WARNING:    test_cutoff is present ($(cat test_cutoff) bytes); no download can complete"
+if [ -f config.cfg ]; then
+    echo "Settings:   config.cfg, CRC $(gzip -c config.cfg | tail -c8 | od -An -tx4 -N4 | tr -d ' '), $(stat -c %s config.cfg) bytes, $(stat -c %y config.cfg | cut -c1-16)"
+else
+    echo "Settings:   no config.cfg (units keep the settings they last received)"
+fi
 echo
 echo "Unit reports (latest HELLO from each):"
 for f in status/*; do
@@ -95,7 +108,10 @@ for f in status/*; do
         END { printf "  %-8s %-8s %s  battery %s mV  trial %s  last reset %s%s\n",
                      id, v["version"], v["time"], v["battery_mv"], v["on_trial"],
                      (v["last_reset"] == "" ? "?" : v["last_reset"]),
-                     (v["rolled_back"] == "" ? "" : "  rolled back " v["rolled_back"]) }' "$f"
+                     (v["rolled_back"] == "" ? "" : "  rolled back " v["rolled_back"])
+              if ("config_current" in v)
+                  printf "           settings %s, current: %s%s\n", v["config"], v["config_current"],
+                         (v["config_refused"] + 0 > 0 ? ", " v["config_refused"] " value(s) REFUSED" : "") }' "$f"
 done
 EOF
 }
@@ -187,7 +203,72 @@ withdraw)
     show_status
     ;;
 
+config)
+    [[ $# -eq 1 ]] || die "usage: release.sh config <file.cfg> [-y]"
+    cfg=$1
+    [[ -f "$cfg" ]] || die "no such file: $cfg"
+    clean=$(mktemp)
+    trap 'rm -f "$clean"' EXIT
+
+    # Check every setting against the firmware's own table of names and ranges, and
+    # write just the settings (no comments) to $clean: that is what units receive
+    note "Checking $cfg against $SETTINGS_C"
+    "$PYTHON" -I - "$cfg" "$SETTINGS_C" "$clean" <<'PY' || die "fix the settings above; nothing changed"
+import re, sys, math
+cfg_path, src_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+table = {}
+for m in re.finditer(r'\{"(\w+)",\s*SET_(FLOAT|U32),\s*F\(\w+\),\s*[^,]+,\s*([-\d.]+),\s*([-\d.]+)\}', open(src_path).read()):
+    table[m.group(1)] = (m.group(2), float(m.group(3)), float(m.group(4)))
+if not table:
+    sys.exit("could not read the settings table from " + src_path)
+problems, values = [], {}
+for n, raw in enumerate(open(cfg_path, encoding="ascii", errors="replace"), 1):
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    if "=" not in line:
+        problems.append(f"line {n}: no '=' in '{line}'"); continue
+    key, val = (p.strip() for p in line.split("=", 1))
+    if key not in table:
+        problems.append(f"line {n}: unknown setting '{key}' (known: {', '.join(table)})"); continue
+    kind, lo, hi = table[key]
+    try:
+        v = float(val)
+    except ValueError:
+        problems.append(f"line {n}: {key}={val} is not a number"); continue
+    if not math.isfinite(v) or v < lo or v > hi or (kind == "U32" and v != int(v)):
+        problems.append(f"line {n}: {key}={val} is outside {lo:g} to {hi:g}" + (" (whole numbers)" if kind == "U32" else "")); continue
+    values[key] = (val, v)
+s, e = values.get("active_start_hour", ("", 0))[1], values.get("active_end_hour", ("", 24))[1]
+if s == e:
+    problems.append(f"active_start_hour and active_end_hour are both {s:g}: that window is empty")
+for p in problems:
+    print("  " + p)
+if problems:
+    sys.exit(1)
+# A file with no settings must still reach the units (an empty file means "no
+# settings on the server", and units would keep their old ones), so it becomes a
+# comment, which units apply as "everything at its default"
+text = "".join(f"{k}={val}\n" for k, (val, _) in values.items()) or "# all firmware defaults\n"
+open(out_path, "w", newline="\n").write(text)
+print("  " + (", ".join(f"{k}={val}" for k, (val, _) in values.items()) or "no settings: units go back to their firmware defaults"))
+PY
+    size=$(stat -c %s "$clean")
+    (( size <= MAX_CONFIG )) || die "the settings come to $size bytes; units accept at most $MAX_CONFIG"
+    crc=$("$PYTHON" -I -c 'import sys, zlib; print("%08x" % zlib.crc32(open(sys.argv[1], "rb").read()))' "$clean")
+    echo
+    echo "Settings:   from $cfg ($size bytes as sent, CRC $crc)"
+    echo "Applies to: every unit on firmware 1.5.0 or later, at its next connection"
+    echo
+    confirm "Publish these settings?"
+    remote "mkdir -p ~/$FW_DIR"
+    scp -q "$clean" "$HOST:$FW_DIR/config.new"
+    remote "mv ~/$FW_DIR/config.new ~/$FW_DIR/config.cfg"
+    note "Published"
+    show_status
+    ;;
+
 *)
-    die "unknown command '$command' (status, publish, units, withdraw)"
+    die "unknown command '$command' (status, publish, units, withdraw, config)"
     ;;
 esac

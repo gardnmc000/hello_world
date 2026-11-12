@@ -1,0 +1,29 @@
+# Bird Watch unit settings: ~/firmware/config.cfg on the server, for every unit.
+# Publish with:  bash server/deploy/release.sh config <file>
+#
+# Units on firmware 1.5.0 or later fetch this on their next connection, check each
+# value against the range below, store the result and apply it straight away.
+# A setting left out (or commented out) takes the default compiled into the
+# firmware, so this file only needs the settings you want to change.
+# A value outside its range is refused (the unit keeps the default) and the
+# refusal shows in ~/firmware/status/<id> as config_refused. Unknown keys are
+# ignored. Lines starting with # are comments. At most 1024 bytes.
+#
+# setting               default   range            meaning
+
+# --- Detection ---
+#min_bird_freq_hz=2000           # 1000-8000      a block must read at least this frequency (Hz)
+#bird_level_ratio=1.5            # 1.1-5.0        ...and this multiple of the background level
+#min_noise_floor=130000          # 10000-2000000  lowest the tracked background level may fall
+
+# --- Sampling and recording ---
+#sample_interval_ms=1000         # 200-60000      pause between listening bursts
+#record_holdoff_s=10             # 0-600          pause after recording a clip
+#clip_length_s=5                 # 1-10           length of each clip (10 s is the upload limit)
+#active_start_hour=0             # 0-23           record from this hour (GMT)...
+#active_end_hour=24              # 1-24           ...until the start of this hour; 22 to 6 wraps past midnight
+
+# --- Reporting and updates ---
+#reporting_interval_s=120        # 60-86400       time between reporting checks
+#fw_check_interval_h=24          # 1-168          connect for a firmware check at least this often
+#ota_min_battery_mv=3600         # 3300-4000      no firmware download or install below this

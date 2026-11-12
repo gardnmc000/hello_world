@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include "esp_psram.h"
 #include "base.h"
+#include "bw_settings.h"
 
 
 
@@ -130,13 +131,15 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
 
         analyse_block(i2s_buff, samples_read, &slope_rms, &freq_hz);
 
+        /*  Read once per block, so a change from the server applies at the next block  */
+        const float min_floor = g_settings.min_noise_floor;
         if (noise_floor == 0) {
             /*  The minimum applies from the first block, as it does after every update  */
-            noise_floor = fmaxf(slope_rms, BW_MIN_NOISE_FLOOR);
+            noise_floor = fmaxf(slope_rms, min_floor);
         }
 
         /*  A bird stands out from the current background, and is above the range of wind and traffic  */
-        bool bird = (slope_rms >= noise_floor * BW_BIRD_LEVEL_RATIO) && (freq_hz >= BW_MIN_BIRD_FREQ_HZ);
+        bool bird = (slope_rms >= noise_floor * g_settings.bird_level_ratio) && (freq_hz >= g_settings.min_bird_freq_hz);
         if (bird) {
             bird_blocks++;
         }
@@ -150,8 +153,8 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
         } else {
             noise_floor *= BW_FLOOR_RISE_RATE;
         }
-        if (noise_floor < BW_MIN_NOISE_FLOOR) {
-            noise_floor = BW_MIN_NOISE_FLOOR;
+        if (noise_floor < min_floor) {
+            noise_floor = min_floor;
         }
 
 
@@ -172,16 +175,10 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
             }
         }
     }
-    ESP_LOGI(TAG, "Acc Slope %08x, Acc DELTA: %d, Max Vol:  %08x, Right Shift: %d", (int) accum_slope, (int) (accum_slope / BW_DELTA_THRESHOLD), (int) max_volume, (int) right_shift);
-    //dft_forward((int32_t *) &i2s_buff);
-    
-    if (BW_USE_NEW_RULE) {
-        return (bird_blocks);
-    }
-    else {    
-        /*  Old rule  */
-        return (accum_slope / BW_DELTA_THRESHOLD);
-    }
+    ESP_LOGI(TAG, "Acc Slope %08x, Bird blocks: %d, Max Vol:  %08x, Right Shift: %d", (int) accum_slope, (int) bird_blocks, (int) max_volume, (int) right_shift);
+
+    /*  The number of blocks in this burst that passed the bird test  */
+    return (bird_blocks);
 }
 
 
@@ -219,8 +216,8 @@ void build_clip16(i2s_chan_handle_t rx_handle, const char * filespec)  {
     bool read_active = true;
     /*  Typically = 4096 / 44100 = 0.0928 seconds or 10.8 samples per second  */
     float seconds_per_sample = (float) ((float) SAMPLE_BUFFER_SIZE / config.clk_cfg.sample_rate_hz);
-    /*  Typically 5 seconds  */
-    float required_clip_length = BW_DEFAULT_CLIP_LENGTH;
+    /*  Typically 5 seconds; set by the server's clip_length_s  */
+    float required_clip_length = (float) g_settings.clip_length_s;
     /*  Typically  = 54 ( 5 seconds * 10.8 = 53.8 rounded up)  */
     float samples_per_clip = 1 + (required_clip_length / seconds_per_sample);
     /*  Convert to int for later calculations  */

@@ -5,11 +5,16 @@
 #
 # If the new binary does not start and listen on its port, the previous one is
 # put back and restarted, and the script exits with an error.
+#
+# Restarting the service cuts off every connection in progress, so it refuses
+# while a unit is connected (a cut-off upload leaves a partial clip on the server).
+# Run it again a little later, or add --force to deploy regardless.
 
 set -euo pipefail
 
 HOST=mike@10.147.20.210
-NAME=${1:?usage: deploy.sh <server name, e.g. socksrvr>}
+NAME=${1:?usage: deploy.sh <server name, e.g. socksrvr> [--force]}
+FORCE=${2:-}
 
 case "$NAME" in
     socksrvr) BIN=socksrvr.3590; PORT=3590 ;;
@@ -26,6 +31,14 @@ ssh "$HOST" "cd ~/bw_server_src && make CXX=g++ LDFLAGS= build/$NAME"
 echo "== Updating the service definition"
 scp -q "$SERVER_DIR/deploy/$NAME.service" "$HOST:.config/systemd/user/$NAME.service"
 ssh "$HOST" 'systemctl --user daemon-reload'
+
+echo "== Checking for connections in progress"
+busy=$(ssh -n "$HOST" "pgrep -c -P \$(systemctl --user show -p MainPID --value $NAME) 2>/dev/null || true")
+if [[ "${busy:-0}" != 0 && "$FORCE" != --force ]]; then
+    echo "A unit is connected ($busy connection(s)); not restarting, so as not to cut it off." >&2
+    echo "The new build is ready on the server; run this again shortly, or add --force." >&2
+    exit 1
+fi
 
 echo "== Swapping in the new binary"
 ssh "$HOST" bash -s <<EOF

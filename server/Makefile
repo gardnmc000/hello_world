@@ -9,7 +9,7 @@ CXXFLAGS := -O0 -g3 -Wall -fmessage-length=0
 LDFLAGS  := -L/usr/lib/aarch64-linux-gnu
 LDLIBS   := -lssl -lcrypto
 
-SERVERS  := socksrvr cfgsrvr
+SERVERS  := socksrvr
 BUILD    := build
 
 all: $(SERVERS:%=$(BUILD)/%)

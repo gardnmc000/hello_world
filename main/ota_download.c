@@ -10,13 +10,14 @@
 #include "base.h"
 #include "ota_update.h"
 #include "storage.h"
+#include "bw_settings.h"
 #include "esp_app_desc.h"
 #include "esp_task_wdt.h"
 #include "mbedtls/sha256.h"
 #include <sys/stat.h>
 #include <errno.h>
 
-#define FW_HELLO_LEN    64
+#define FW_HELLO_LEN    72              /*  FWH2: FWH1 (64) + settings CRC, refused count, 3 reserved  */
 #define FW_OFFER_LEN    72
 #define FW_MAX_IMAGE    (3 * 1024 * 1024)       /*  One app partition  */
 #define DL_CHUNK        4096
@@ -199,22 +200,54 @@ bool ota_check_server(int battery_mv)
         goto done;
     }
 
-    /*  HELLO: id, version, battery, trial flag, last rolled-back version  */
+    /*  HELLO (FWH2): id, version, battery, flags, last rolled-back version,
+     *  then the CRC of the settings applied here and how many values were refused  */
     uint8_t hello[FW_HELLO_LEN] = {0};
     char rolled_back[32];
     ota_rolled_back_version(rolled_back, sizeof(rolled_back));
-    memcpy(hello, "FWH1", 4);
+    memcpy(hello, "FWH2", 4);
     strncpy((char *) hello + 4, &szmac_addr[6], 8);
     strncpy((char *) hello + 12, app->version, 32);
     put_u16(hello + 44, battery_mv > 0 ? (uint16_t) battery_mv : 0);
     /*  Flags: bit 0 on trial; bits 8-15 why this boot started (esp_reset_reason_t)  */
     put_u16(hello + 46, (uint16_t) ((trial ? 1 : 0) | ((esp_reset_reason() & 0xff) << 8)));
     strncpy((char *) hello + 48, rolled_back, 16);
+    put_u32(hello + 64, settings_crc());
+    hello[68] = settings_rejected();
+
+    if (!send_buffer(fd, fw_signature, sizeof(fw_signature)) ||
+        !send_buffer(fd, hello, sizeof(hello))) {
+        ESP_LOGW(DL_TAG, "Firmware check did not complete");
+        goto done;
+    }
+
+    /*  Settings first: "CFG0" (ours are current, or the server has none), or "CFG1",
+     *  a 2-byte length and the server's config text  */
+    uint8_t tag[4];
+    if (!receive_exact(fd, tag, sizeof(tag))) {
+        ESP_LOGW(DL_TAG, "Firmware check did not complete");
+        goto done;
+    }
+    if (memcmp(tag, "CFG1", 4) == 0) {
+        static char cfg_text[BW_SETTINGS_MAX_TEXT];     /*  Static: the startup task's stack is small  */
+        uint8_t len_bytes[2];
+        if (!receive_exact(fd, len_bytes, 2)) {
+            goto done;
+        }
+        size_t cfg_len = len_bytes[0] | (len_bytes[1] << 8);
+        if (cfg_len > sizeof(cfg_text) || !receive_exact(fd, cfg_text, cfg_len)) {
+            ESP_LOGE(DL_TAG, "Settings from the server were too long or incomplete; ignored");
+            goto done;
+        }
+        ESP_LOGI(DL_TAG, "New settings from the server (%u bytes)", (unsigned) cfg_len);
+        settings_apply_text(cfg_text, cfg_len);
+    } else if (memcmp(tag, "CFG0", 4) != 0) {
+        ESP_LOGW(DL_TAG, "Unexpected reply from the server; firmware check abandoned");
+        goto done;
+    }
 
     uint8_t offer[FW_OFFER_LEN];
-    if (!send_buffer(fd, fw_signature, sizeof(fw_signature)) ||
-        !send_buffer(fd, hello, sizeof(hello)) ||
-        !receive_exact(fd, offer, sizeof(offer))) {
+    if (!receive_exact(fd, offer, sizeof(offer))) {
         ESP_LOGW(DL_TAG, "Firmware check did not complete");
         goto done;
     }
@@ -242,8 +275,9 @@ bool ota_check_server(int battery_mv)
         ESP_LOGW(DL_TAG, "Running firmware is still on trial; download postponed");
         goto done;
     }
-    if (battery_mv > 0 && battery_mv < BW_OTA_MIN_BATTERY_MV) {
-        ESP_LOGW(DL_TAG, "Battery %d mV is below %d mV; download postponed", battery_mv, BW_OTA_MIN_BATTERY_MV);
+    int min_mv = (int) g_settings.ota_min_battery_mv;
+    if (battery_mv > 0 && battery_mv < min_mv) {
+        ESP_LOGW(DL_TAG, "Battery %d mV is below %d mV; download postponed", battery_mv, min_mv);
         goto done;
     }
     if (want.size == 0 || want.size > FW_MAX_IMAGE) {

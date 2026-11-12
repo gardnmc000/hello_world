@@ -30,7 +30,6 @@ extern esp_modem_dce_t *dce;
 extern char*  txbuffer;
 extern char*  rxbuffer;
 extern struct sockaddr_in dest_addr;
-extern struct BW_CONFIG bw_config;
 static bool lock_storage(void)
 {
     if (storage_mutex == NULL ||
@@ -213,7 +212,9 @@ int send_file(char *filename) {
             }
             break;
         }
-        if (packet_number >= 500 || !send_buffer(sock, txbuffer, (size_t)bytes_read)) {
+        /*  The server acknowledges with "OK" and 3 digits, so 999 packets of 1024 bytes
+         *  is the most it can take: a clip of about 11.6 s (clip_length_s allows up to 10)  */
+        if (packet_number >= 999 || !send_buffer(sock, txbuffer, (size_t)bytes_read)) {
             ESP_LOGE(STORAGE_TAG, "Transfer failed or exceeded packet limit");
             goto cleanup;
         }
@@ -691,42 +692,4 @@ int read_adc_voltage_gpio8(void)
     adc_oneshot_del_unit(adc1_handle);
 
     return voltage;
-}
-
-
-int store_config(struct BW_CONFIG cfg) {
- 
-  char cfg_path[32];
-
-  if (!lock_storage()) {
-    ESP_LOGE(STORAGE_TAG, "Unable to lock storage for config write");
-    return -1;
-  }
-  if (cfg.clip_len == 0 || cfg.clip_interval == 0 || cfg.freq_slope == 0 || cfg.vol_threshold == 0) {
-    ESP_LOGE(STORAGE_TAG, "Invalid configuration values provided");
-    unlock_storage();
-    return -1;
-  }
-  if (cfg.reserved_1 != 0 || cfg.reserved_2 != 0) {
-    ESP_LOGW(STORAGE_TAG, "Reserved fields should be zero; received reserved_1: %d, reserved_2: %d", cfg.reserved_1, cfg.reserved_2);
-  }
-
-  snprintf(cfg_path, sizeof(cfg_path),  SD_MOUNT_POINT "/config.cfg");
-
-  FILE *config_file = fopen(cfg_path, "wb");
-  if (config_file == NULL) {
-    ESP_LOGE(STORAGE_TAG, "Failed to open config file for writing: errno %d", errno);
-    unlock_storage();
-    return -1;
-  }
-
-  int write_bytes = fwrite(&cfg, 1, sizeof(cfg), config_file);
-  if (fclose(config_file) != 0) {
-    write_bytes = 0;
-  }
-  unlock_storage();
-
-  ESP_LOGI(STORAGE_TAG, "store_config() wrote clip_len: %d, clip_interval: %d, freq_slope: %d, vol_threshold: %d, reserved_1: %d, reserved_2: %d", cfg.clip_len, cfg.clip_interval, cfg.freq_slope, cfg.vol_threshold, cfg.reserved_1, cfg.reserved_2);
-    
-  return (write_bytes);  
 }
