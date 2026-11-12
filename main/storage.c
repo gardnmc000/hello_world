@@ -72,7 +72,7 @@ static const wav_header_t wav_header_template =
 };
      
 
-static bool send_buffer(int fd, const void *data, size_t length) {
+bool send_buffer(int fd, const void *data, size_t length) {
     const uint8_t *bytes = data;
     size_t sent = 0;
 
@@ -87,7 +87,7 @@ static bool send_buffer(int fd, const void *data, size_t length) {
     return true;
 }
 
-static bool receive_exact(int fd, void *data, size_t length) {
+bool receive_exact(int fd, void *data, size_t length) {
     uint8_t *bytes = data;
     size_t received = 0;
 
@@ -102,7 +102,7 @@ static bool receive_exact(int fd, void *data, size_t length) {
     return true;
 }
 
-static bool connect_with_timeout(int fd, const struct sockaddr *address, socklen_t address_length) {
+bool connect_with_timeout(int fd, const struct sockaddr *address, socklen_t address_length) {
     int original_flags = fcntl(fd, F_GETFL, 0);
     if (original_flags < 0 || fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) < 0) {
         return false;
@@ -347,6 +347,11 @@ void mount_sdcard(void) {
 /*  Scan the output directory, and identify the index number for the first file encountered with a '.wav' extensions    */
 /*  Return the index number for use by the caller                                                                       */
 int get_next_dir_entry(char * filename) {
+  return get_next_dir_entry_excluding(filename, NULL, 0);
+}
+
+/*  As get_next_dir_entry, but passes over the names in skip[]  */
+int get_next_dir_entry_excluding(char * filename, const char (*skip)[BW_CLIP_NAME_MAX], int skip_count) {
 
   ESP_LOGI(STORAGE_TAG, "list_directory()");
 
@@ -366,7 +371,14 @@ int get_next_dir_entry(char * filename) {
   while ((dir = readdir(d)) != NULL) {
     const char *extension = strrchr(dir->d_name, '.');
     if (dir->d_type == DT_REG && extension != NULL &&
-        strcmp(extension, ".wav") == 0) {
+        strcmp(extension, ".wav") == 0 && strlen(dir->d_name) == BW_CLIP_NAME_LEN) {
+      bool skipped = false;
+      for (int i = 0; i < skip_count && !skipped; i++) {
+        skipped = strcmp(dir->d_name, skip[i]) == 0;
+      }
+      if (skipped) {
+        continue;
+      }
       int length = snprintf(filename, 256, "%s", dir->d_name);
       if (length < 0 || length >= 256) {
         ESP_LOGE(STORAGE_TAG, "Recording filename is too long");

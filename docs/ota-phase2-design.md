@@ -48,7 +48,7 @@ Strings are NUL-padded.
 | 4–11 | device id | the 6 MAC hex digits used in clip names, e.g. `f30f1c` |
 | 12–43 | running version | from `esp_app_get_description()` |
 | 44–45 | battery mV | `uint16`, reading taken before the modem was powered |
-| 46–47 | flags | bit 0: running firmware is still on trial |
+| 46–47 | flags | bit 0: running firmware is still on trial; bits 8–15: why this boot started (`esp_reset_reason_t`, from 1.4.5; 0 = unknown) |
 | 48–63 | rolled-back version | first 16 bytes, empty if none |
 
 The server logs every HELLO, so it also serves as the version and rollback report

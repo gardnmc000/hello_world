@@ -21,12 +21,23 @@ void mount_sdcard(void);
 /*  Return 1 when found, 0 when empty, or -1 when the directory cannot be scanned. Caller provides 256 bytes.           */
 int get_next_dir_entry(char * filename);
 
+/*  As get_next_dir_entry, but passes over the skip_count names in skip[]  */
+#define BW_CLIP_NAME_MAX 64
+#define BW_CLIP_NAME_LEN 22     /*  "Dxxxxxxyydddhhmmss.wav"; the server only accepts this length.
+                                    Other .wav files are not clips and are left alone.  */
+int get_next_dir_entry_excluding(char * filename, const char (*skip)[BW_CLIP_NAME_MAX], int skip_count);
+
 /*  Scan the output directory, and identify the index number for the first file encountered with a '.bin' extensions    */
 /*  Return the index number for use by the caller                                                                       */
 int archive_clip(char * filename);
 int delete_clip(const char * filename);
 
 void close_data_socket(void);
+
+/*  Socket helpers shared by the clip upload and the firmware download  */
+bool send_buffer(int fd, const void *data, size_t length);
+bool receive_exact(int fd, void *data, size_t length);
+bool connect_with_timeout(int fd, const struct sockaddr *address, socklen_t address_length);   /*  15 s  */
 int save_recording(const char *filespec, const void *pcm_data, size_t pcm_length);
 int read_adc_voltage_gpio8(void);
 

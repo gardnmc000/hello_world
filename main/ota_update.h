@@ -12,6 +12,12 @@
 #define BW_OTA_BAD_FILE       SD_MOUNT_POINT "/fw_bad.bin"     /*  Renamed to this if it was rolled back  */
 #define BW_OTA_VALID_AFTER_MS (60 * 60 * 1000)                 /*  1 hour without a crash marks it valid  */
 #define BW_OTA_MAX_POWER_ROLLBACKS 3                           /*  Trials lost to power problems before a release is blocked  */
+#define BW_OTA_MIN_BATTERY_MV 3600                             /*  No download or install below this (battery, at rest)  */
+#define BW_OTA_CHECK_INTERVAL_MS (24 * 60 * 60 * 1000)         /*  Connect for a firmware check at least this often,
+                                                                   even with no clips to send. Too big for
+                                                                   pdMS_TO_TICKS, which overflows above ~11.9 h  */
+#define BW_OTA_DL_FILE        SD_MOUNT_POINT "/fw_dl.bin"      /*  Download in progress                    */
+#define BW_OTA_DL_INFO_FILE   SD_MOUNT_POINT "/fw_dl.inf"      /*  What the download in progress should be */
 
 /*  Call once at boot, before the other tasks start. Logs the running version, reports
  *  an earlier rollback, and starts the 1 hour timer if this firmware is on trial.     */
@@ -28,5 +34,17 @@ void ota_mark_valid(const char *reason);
 /*  True if this version failed a trial and must not be installed (or downloaded) again:
  *  it crashed, or lost BW_OTA_MAX_POWER_ROLLBACKS trials to power problems.          */
 bool ota_version_blocked(const char *version);
+
+/*  The last rolled-back version, or "" if none; reported to the server  */
+void ota_rolled_back_version(char *out, size_t size);
+
+/*  True while the running firmware is on trial  */
+bool ota_on_trial(void);
+
+/*  Call while PPP is up. Reports this unit to the server and downloads any new
+ *  firmware it offers to /sdcard/firmware.bin, resuming an earlier partial
+ *  download. Returns true when a complete, verified image is ready: the caller
+ *  should then shut the modem down and restart, so ota_install_from_sd() runs.  */
+bool ota_check_server(int battery_mv);
 
 #endif /* MAIN_OTA_UPDATE_H_ */

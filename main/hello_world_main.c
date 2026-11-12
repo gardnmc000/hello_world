@@ -80,6 +80,15 @@ void app_main(void)
             if (!sync_network_time()) {
                 ESP_LOGW(MAIN_TAG, "Startup network time synchronization failed");
             }
+
+            /*  Report to the server and fetch any new firmware it offers. Sampling has
+             *  not started, so a restart here cannot cut a clip short.  */
+            if (ota_check_server(adc_val * 2)) {
+                graceful_power_down();
+                ESP_LOGI(MAIN_TAG, "Restarting to install the new firmware");
+                vTaskDelay(pdMS_TO_TICKS(500));
+                esp_restart();
+            }
         } else if (err != ESP_OK) {
             ESP_LOGE(MAIN_TAG, "Failed to start PPP for startup time synchronization: %s", esp_err_to_name(err));
         } else {
@@ -109,22 +118,58 @@ void app_main(void)
         ESP_LOGE(MAIN_TAG, "Failed to create sampling task");
         ESP_ERROR_CHECK(ESP_FAIL);
     }
-//    if (xTaskCreate(reporting_task, "reporter", 12288, NULL, 5, NULL) != pdPASS) {
-//        ESP_LOGE(MAIN_TAG, "Failed to create reporting task");
-//        ESP_ERROR_CHECK(ESP_FAIL);
-//    }
+    if (xTaskCreate(reporting_task, "reporter", 12288, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(MAIN_TAG, "Failed to create reporting task");
+        ESP_ERROR_CHECK(ESP_FAIL);
+    }
     vTaskDelete(NULL);
 }
 
+/*  Failed attempts per clip, kept across connections. A clip is deleted after
+ *  BW_MAX_FILE_ATTEMPTS; if the table is full, the oldest entry is reused.  */
+#define BW_MAX_FAILED_CLIPS 16
+static struct {
+    char name[BW_CLIP_NAME_MAX];
+    int  attempts;
+} s_clip_failures[BW_MAX_FAILED_CLIPS];
+static int s_clip_failures_next = 0;
+
+static int count_clip_failure(const char *name)
+{
+    for (int i = 0; i < BW_MAX_FAILED_CLIPS; i++) {
+        if (strcmp(s_clip_failures[i].name, name) == 0) {
+            return ++s_clip_failures[i].attempts;
+        }
+    }
+    int slot = s_clip_failures_next;
+    s_clip_failures_next = (s_clip_failures_next + 1) % BW_MAX_FAILED_CLIPS;
+    strlcpy(s_clip_failures[slot].name, name, sizeof(s_clip_failures[slot].name));
+    s_clip_failures[slot].attempts = 1;
+    return 1;
+}
+
+static void forget_clip_failure(const char *name)
+{
+    for (int i = 0; i < BW_MAX_FAILED_CLIPS; i++) {
+        if (strcmp(s_clip_failures[i].name, name) == 0) {
+            s_clip_failures[i].name[0] = '\0';
+            s_clip_failures[i].attempts = 0;
+        }
+    }
+}
+
+/*  Sends every pending clip it can on this connection. A clip the server rejects
+ *  is passed over until the next connection, so it cannot hold up the others;
+ *  only losing the server ends the batch early.  */
 static bool send_pending_files(void)
 {
-    /*  Only the first clip in the directory is retried, so one counter is enough  */
-    static char failing_file[256];
-    static int failed_attempts = 0;
+    static char skip[BW_MAX_FAILED_CLIPS][BW_CLIP_NAME_MAX];   /*  Failed on this connection  */
+    int skip_count = 0;
     char filename[256];
     int result;
+    bool all_sent = true;
 
-    while ((result = get_next_dir_entry(filename)) > 0) {
+    while ((result = get_next_dir_entry_excluding(filename, skip, skip_count)) > 0) {
         esp_task_wdt_reset();
         ESP_LOGI(MAIN_TAG, "Sending pending clip: %s", filename);
         sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
@@ -140,24 +185,28 @@ static bool send_pending_files(void)
             return false;
         }
         if (sent == BW_SEND_FILE_FAILED) {
-            if (strcmp(filename, failing_file) != 0) {
-                strlcpy(failing_file, filename, sizeof(failing_file));
-                failed_attempts = 0;
+            int attempts = count_clip_failure(filename);
+            if (attempts >= BW_MAX_FILE_ATTEMPTS) {
+                ESP_LOGE(MAIN_TAG, "Deleting %s after %d failed attempts", filename, attempts);
+                forget_clip_failure(filename);
+                if (delete_clip(filename) != 0) {
+                    return false;
+                }
+                continue;
             }
-            failed_attempts++;
-            if (failed_attempts < BW_MAX_FILE_ATTEMPTS) {
-                ESP_LOGE(MAIN_TAG, "Transfer of %s failed (attempt %d/%d)",
-                         filename, failed_attempts, BW_MAX_FILE_ATTEMPTS);
+            all_sent = false;
+            if (strlen(filename) >= BW_CLIP_NAME_MAX || skip_count >= BW_MAX_FAILED_CLIPS) {
+                /*  Cannot be passed over, so stop rather than retry it in a loop  */
+                ESP_LOGE(MAIN_TAG, "Transfer of %s failed (attempt %d/%d); stopping this batch",
+                         filename, attempts, BW_MAX_FILE_ATTEMPTS);
                 return false;
             }
-            ESP_LOGE(MAIN_TAG, "Deleting %s after %d failed attempts", filename, failed_attempts);
-            failing_file[0] = '\0';
-            failed_attempts = 0;
-            if (delete_clip(filename) != 0) {
-                return false;
-            }
+            ESP_LOGE(MAIN_TAG, "Transfer of %s failed (attempt %d/%d); carrying on with the others",
+                     filename, attempts, BW_MAX_FILE_ATTEMPTS);
+            strlcpy(skip[skip_count++], filename, BW_CLIP_NAME_MAX);
             continue;
         }
+        forget_clip_failure(filename);
         if (archive_clip(filename) != 0) {
             /*  The server already has this clip, so only the local copy is lost  */
             ESP_LOGE(MAIN_TAG, "Failed to archive %s; deleting it", filename);
@@ -172,8 +221,12 @@ static bool send_pending_files(void)
         ESP_LOGE(MAIN_TAG, "Failed to scan the recordings directory");
         return false;
     }
-    ESP_LOGI(MAIN_TAG, "No more pending clips");
-    return true;
+    if (skip_count > 0) {
+        ESP_LOGW(MAIN_TAG, "All other clips sent; %d failed and will be retried next time", skip_count);
+    } else {
+        ESP_LOGI(MAIN_TAG, "No more pending clips");
+    }
+    return all_sent;
 }
 
 
@@ -208,16 +261,30 @@ static bool sync_network_time(void)
 
 /*  Test file D_0f44_26297141832 captured during file transfer  */
 
+/*  Set by the reporting task when a downloaded update is ready. The sampler
+ *  restarts the unit between samples, so a clip being saved is never cut short.  */
+static volatile bool s_restart_for_update = false;
+
 void reporting_task(void *pvParameters)
 {
     (void)pvParameters;
     TickType_t next_report = xTaskGetTickCount();
     const TickType_t report_interval = pdMS_TO_TICKS(BW_REPORTING_INTERVAL_MS);
     const TickType_t feed_interval = pdMS_TO_TICKS(BW_WDT_FEED_INTERVAL_MS);
+    /*  The startup connection has just checked for firmware  */
+    TickType_t last_fw_check = xTaskGetTickCount();
+    /*  Not pdMS_TO_TICKS: it multiplies by the tick rate before dividing, which
+     *  overflows 32 bits above about 11.9 hours (24 hours came out as 8 minutes)  */
+    const TickType_t fw_check_interval = (TickType_t) (BW_OTA_CHECK_INTERVAL_MS / 1000) * configTICK_RATE_HZ;
 
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
     for (;;) {
+        /*  Count the interval from the end of the last cycle. A fixed timetable would
+         *  start the next connection at once whenever a long upload overran the
+         *  interval, which costs a whole reconnection for nothing.  */
+        next_report = xTaskGetTickCount();
+
         /*  The report interval can exceed the watchdog timeout, so wait in slices  */
         for (TickType_t remaining = report_interval; remaining > 0; ) {
             TickType_t wait = (remaining < feed_interval) ? remaining : feed_interval;
@@ -226,18 +293,34 @@ void reporting_task(void *pvParameters)
             remaining -= wait;
         }
 
+        if (s_restart_for_update) {
+            continue;   /*  Waiting for the sampler to restart the unit  */
+        }
+
         char filename[256];
         int pending = get_next_dir_entry(filename);
         if (pending < 0) {
             ESP_LOGE(MAIN_TAG, "Unable to inspect recordings directory");
             continue;
         }
-        if (pending == 0) {
+        bool fw_check_due = (xTaskGetTickCount() - last_fw_check) >= fw_check_interval;
+        if (pending == 0 && !fw_check_due) {
             ESP_LOGI(MAIN_TAG, "Hourly check: no recordings to send");
             continue;
         }
 
-        ESP_LOGI(MAIN_TAG, "Hourly check: pending recordings found");
+        if (pending > 0) {
+            ESP_LOGI(MAIN_TAG, "Hourly check: pending recordings found");
+        } else {
+            ESP_LOGI(MAIN_TAG, "Hourly check: no recordings, but a firmware check is due");
+        }
+        if (fw_check_due) {
+            /*  Count the attempt, so a site with no signal does not retry every cycle  */
+            last_fw_check = xTaskGetTickCount();
+        }
+
+        /*  Read the battery before the modem loads it  */
+        int battery_mv = read_adc_voltage_gpio8() * 2;
         if (ensure_modem_on() != ESP_OK) {
             ESP_LOGE(MAIN_TAG, "Modem is not ready; will retry at the next hourly check");
             graceful_power_down();
@@ -266,13 +349,25 @@ void reporting_task(void *pvParameters)
 
         esp_task_wdt_reset();
 
-        ESP_LOGI(MAIN_TAG, "Connected; sending pending recordings");
         sync_network_time();
-        if (!send_pending_files()) {
-            ESP_LOGW(MAIN_TAG, "Some recordings remain pending until the next hourly check");
+        if (pending > 0) {
+            ESP_LOGI(MAIN_TAG, "Connected; sending pending recordings");
+            if (!send_pending_files()) {
+                ESP_LOGW(MAIN_TAG, "Some recordings remain pending until the next hourly check");
+            }
         }
         esp_task_wdt_reset();
+
+        /*  Clips first, so an update never delays them  */
+        bool update_ready = ota_check_server(battery_mv);
+        last_fw_check = xTaskGetTickCount();
+        esp_task_wdt_reset();
         graceful_power_down();
+
+        if (update_ready) {
+            ESP_LOGI(MAIN_TAG, "New firmware is ready; restarting between samples");
+            s_restart_for_update = true;
+        }
     }
 }
 
@@ -285,6 +380,11 @@ void handle_dev_state(void *pvParameters)
     
     for (;;) {
         esp_task_wdt_reset();
+        if (s_restart_for_update) {
+            ESP_LOGI(MAIN_TAG, "Restarting to install the new firmware");
+            vTaskDelay(pdMS_TO_TICKS(500));   /*  Let the log drain  */
+            esp_restart();
+        }
         bool hit = measure_burst_sample(tick_count++);
         if (hit) {
             gpio_set_level(LED_GREEN, LED_ON);

@@ -16,6 +16,7 @@
 
 #include "base.h"
 #include "ota_update.h"
+#include "storage.h"
 #include "esp_ota_ops.h"
 #include "esp_app_format.h"
 #include "esp_app_desc.h"
@@ -165,7 +166,7 @@ bool ota_version_blocked(const char *version)
         }
     }
 
-    /*  No record (e.g. rolled back by older firmware): the cause is unknown, so block it  */
+    /*  No record (for example, rolled back by older firmware): the cause is unknown, so block it  */
     const esp_partition_t *invalid = esp_ota_get_last_invalid_partition();
     esp_app_desc_t invalid_desc;
     return invalid != NULL && esp_ota_get_partition_description(invalid, &invalid_desc) == ESP_OK &&
@@ -192,6 +193,30 @@ static bool read_image_version(FILE *f, esp_app_desc_t *desc)
     }
     desc->version[sizeof(desc->version) - 1] = '\0';
     return fseek(f, 0, SEEK_SET) == 0;
+}
+
+void ota_rolled_back_version(char *out, size_t size)
+{
+    out[0] = '\0';
+    nvs_handle_t h;
+    if (s_nvs_ok && nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_string(h, KEY_RB_VER, out, size);
+        nvs_close(h);
+    }
+    if (out[0] == '\0') {
+        const esp_partition_t *invalid = esp_ota_get_last_invalid_partition();
+        esp_app_desc_t invalid_desc;
+        if (invalid != NULL && esp_ota_get_partition_description(invalid, &invalid_desc) == ESP_OK) {
+            strlcpy(out, invalid_desc.version, size);
+        }
+    }
+}
+
+bool ota_on_trial(void)
+{
+    esp_ota_img_states_t state;
+    return esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+           state == ESP_OTA_IMG_PENDING_VERIFY;
 }
 
 static void validation_timer_task(void *pvParameters)
@@ -335,6 +360,15 @@ void ota_install_from_sd(void)
     esp_ota_img_states_t state;
     if (esp_ota_get_state_partition(running, &state) == ESP_OK && state == ESP_OTA_IMG_PENDING_VERIFY) {
         ESP_LOGW(OTA_TAG, "Running firmware is still on trial; install postponed");
+        fclose(f);
+        return;
+    }
+
+    /*  A power failure part-way through would be survived, but a flat battery
+     *  would only lose the trial; wait for a charge. An ADC error does not block it.  */
+    int battery_mv = read_adc_voltage_gpio8() * 2;
+    if (battery_mv > 0 && battery_mv < BW_OTA_MIN_BATTERY_MV) {
+        ESP_LOGW(OTA_TAG, "Battery %d mV is below %d mV; install postponed", battery_mv, BW_OTA_MIN_BATTERY_MV);
         fclose(f);
         return;
     }

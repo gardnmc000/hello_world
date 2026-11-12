@@ -1,28 +1,3 @@
-//#include <stdio.h>
-//#include <openssl/ssl.h>
-//#include <openssl/crypto.h>
-//
-//int main() {
-//
-//	    // Initialize OpenSSL
-//	    OPENSSL_init_ssl(0, NULL);
-//
-//        printf("Successfully linked to OpenSSL");
-//        printf("Version: %s", OpenSSL_version(OPENSSL_VERSION));
-//
-//        return 0;
-//
-//}
-
-
-
-
-
-
-/*
-** server.c -- a stream socket server demo
-*/
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -52,20 +27,43 @@
 
 int storeblock(char * filename, char * block, int blocksize);
 
-/*  The name comes from the network, so it must be a plain file name in the working
- *  directory: no '/', no leading '.', nothing but letters, digits, '_', '.' and '-'.  */
+#define CLIP_NAME_LEN 22
+
+/*  The name comes from the network, so it must be exactly a clip name:
+ *    D (or E, for a name moved on after a clash), 6 lowercase hex digits from the MAC,
+ *    11 timestamp digits (yy ddd hh mm ss), then ".wav". That is always 22 bytes.
+ *
+ *  TEMPORARY: names starting "D_" come from units still on the old firmware
+ *  (D_4c30), whose 24-byte names arrive cut to 22. They are accepted as before,
+ *  as long as they are plain file names. Remove this once D_4c30 is updated.  */
 static bool valid_clip_name(const char *name, int length)
 {
-	if (length <= 0 || length > 22 || name[0] == '.') {
+	if (length != CLIP_NAME_LEN) {
 		return false;
 	}
-	for (int i = 0; i < length; i++) {
-		unsigned char c = (unsigned char) name[i];
-		if (!(isalnum(c) || c == '_' || c == '.' || c == '-')) {
+	if (name[0] == 'D' && name[1] == '_') {
+		for (int i = 0; i < length; i++) {
+			unsigned char c = (unsigned char) name[i];
+			if (!(isalnum(c) || c == '_' || c == '.' || c == '-')) {
+				return false;
+			}
+		}
+		return true;
+	}
+	if (name[0] != 'D' && name[0] != 'E') {
+		return false;
+	}
+	for (int i = 1; i <= 6; i++) {
+		if (!isdigit((unsigned char) name[i]) && !(name[i] >= 'a' && name[i] <= 'f')) {
 			return false;
 		}
 	}
-	return true;
+	for (int i = 7; i <= 17; i++) {
+		if (!isdigit((unsigned char) name[i])) {
+			return false;
+		}
+	}
+	return memcmp(name + 18, ".wav", 4) == 0;
 }
 
 
@@ -74,7 +72,8 @@ static bool valid_clip_name(const char *name, int length)
  *
  *  unit -> server   signature (8)   19 57 55 aa c0 03 f0 1f
  *  unit -> server   HELLO (64)      "FWH1", id[8], version[32], battery mV (u16),
- *                                   flags (u16), rolled-back version[16]
+ *                                   flags (u16: bit 0 on trial, bits 8-15 reset reason),
+ *                                   rolled-back version[16]
  *  server -> unit   OFFER (72)      "NONE" | "OFFR", version[32], size (u32), sha256[32]
  *  unit -> server   GET (8)         "GET1", offset (u32)
  *  server -> unit   image bytes from offset to the end, then close
@@ -216,6 +215,18 @@ static unsigned char *load_image(const char *dir, size_t *size, char *version, s
 	return buf;
 }
 
+/*  HELLO flags bits 8-15: why the unit's current boot started (ESP-IDF esp_reset_reason_t).
+ *  Units before 1.4.5 send 0 here, which reads as "unknown".  */
+static const char *reset_reason_name(unsigned reason)
+{
+	static const char *names[] = {
+		"unknown", "power-on", "reset pin", "software restart", "crash", "interrupt watchdog",
+		"task watchdog", "watchdog", "deep sleep wake", "brownout", "SDIO", "USB", "JTAG",
+		"eFuse error", "power glitch", "CPU lockup"
+	};
+	return reason < sizeof(names) / sizeof(names[0]) ? names[reason] : "unknown";
+}
+
 static void write_status(const char *dir, const char *id, const char *ip, const char *version,
                          unsigned battery_mv, unsigned flags, const char *rolled_back)
 {
@@ -234,8 +245,8 @@ static void write_status(const char *dir, const char *id, const char *ip, const 
 		printf("Unable to write %s\n", path);
 		return;
 	}
-	fprintf(f, "time=%s\nip=%s\nversion=%s\nbattery_mv=%u\non_trial=%u\nrolled_back=%s\n",
-	        when, ip, version, battery_mv, flags & 1u, rolled_back);
+	fprintf(f, "time=%s\nip=%s\nversion=%s\nbattery_mv=%u\non_trial=%u\nrolled_back=%s\nlast_reset=%s\n",
+	        when, ip, version, battery_mv, flags & 1u, rolled_back, reset_reason_name(flags >> 8));
 	fclose(f);
 }
 
@@ -258,7 +269,8 @@ static void handle_firmware(int fd, const char *ip)
 		printf("FW %s: rejected device id \"%s\"\n", ip, id);
 		return;
 	}
-	printf("FW %s: unit %s running %s, battery %u mV%s%s%s\n", ip, id, version, battery_mv,
+	printf("FW %s: unit %s running %s, battery %u mV, last reset %s%s%s%s\n", ip, id, version, battery_mv,
+	       reset_reason_name(flags >> 8),
 	       (flags & 1u) ? ", on trial" : "",
 	       rolled_back[0] ? ", rolled back " : "", rolled_back);
 
@@ -309,9 +321,24 @@ static void handle_firmware(int fd, const char *ip)
 	struct timeval send_timeout = {30, 0};
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 
+	/*  TEST ONLY: a byte count in test_cutoff makes the server stop there, as if the
+	 *  connection had dropped, so a unit's resume can be tested. Delete the file after.  */
+	size_t end = size;
+	char cutoff_path[512];
+	snprintf(cutoff_path, sizeof(cutoff_path), "%s/test_cutoff", dir);
+	FILE *cf = fopen(cutoff_path, "r");
+	if (cf != NULL) {
+		unsigned long cutoff = 0;
+		if (fscanf(cf, "%lu", &cutoff) == 1 && cutoff > offset && cutoff < size) {
+			end = cutoff;
+			printf("FW %s: TEST cutoff at %lu bytes\n", id, cutoff);
+		}
+		fclose(cf);
+	}
+
 	size_t pos = offset;
-	while (pos < size) {
-		size_t chunk = (size - pos < 4096) ? size - pos : 4096;
+	while (pos < end) {
+		size_t chunk = (end - pos < 4096) ? end - pos : 4096;
 		if (!send_all(fd, image + pos, chunk)) {
 			break;
 		}
@@ -562,15 +589,24 @@ int main(void)
 			else {
 
 				/*  Expect filename "Dxxxxxxyydddhhmmss.wav" (older units: "D_xxxx_yydddhhmmss.wav")  */
+				/*  A name can arrive split across packets, so collect all 22 bytes;
+				 *  a shorter one ends with the 15 s timeout and is refused below  */
 				memset(nambuf, 0, 32);
-				val = recv(new_fd, nambuf, 22, 0);
+				val = 0;
+				while (val < CLIP_NAME_LEN) {
+					int got = recv(new_fd, nambuf + val, CLIP_NAME_LEN - val, 0);
+					if (got <= 0) {
+						break;
+					}
+					val += got;
+				}
 				if (val <= 0) {
 					printf("No filename received\n");
 					close(new_fd);
 					exit(1);
 				}
 				if (!valid_clip_name(nambuf, val)) {
-					printf("Rejected unsafe filename from %s: ", s);
+					printf("Rejected filename from %s: ", s);
 					for (i = 0; i < val; i++) {
 						printf(isprint((unsigned char) nambuf[i]) ? "%c" : "\\x%02x", (unsigned char) nambuf[i]);
 					}
