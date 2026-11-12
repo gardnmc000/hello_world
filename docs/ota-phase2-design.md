@@ -143,6 +143,56 @@ the ESP-IDF v5.3.1 source:
 6. Field units. Units still on pre-Phase-1 firmware (D_4c30) need one USB or SD-card
    update before they can update over the air.
 
+## 6a. Releasing a version (as built and tested, 1.3.0 to 1.4.5)
+
+`server/deploy/release.sh` does steps 3 and 4 with checks (app image, size, signed with
+our key, no version number reused for different contents, upload SHA-256), and asks
+before changing anything:
+
+```
+bash server/deploy/release.sh status
+bash server/deploy/release.sh publish build/bird_watch.bin f30f1c      # or --all
+bash server/deploy/release.sh units f30f1c <id>...                     # or --all
+bash server/deploy/release.sh withdraw
+```
+
+The steps by hand:
+
+1. Set `version.txt` to a version **no unit runs and no test image used**. The server
+   offers its image whenever the unit's version string differs, and a unit skips a
+   version it has blocked, so a reused number can be silently skipped or blocked.
+2. Build with **IDF: Build** (or `tools\idf.ps1 build`). The build signs
+   `build\bird_watch.bin` with `C:\Users\gardn\keys\bird_watch_signing.pem`.
+3. Copy it to the server under a temporary name, then rename it, so a unit is never
+   offered a half-copied file:
+   ```
+   scp build/bird_watch.bin mike@10.147.20.210:firmware/bird_watch.new
+   ssh mike@10.147.20.210 "mv ~/firmware/bird_watch.new ~/firmware/bird_watch.bin"
+   ```
+4. Choose who gets it in `~/firmware/devices.txt`: one unit id per line (the 6 MAC hex
+   digits in its clip names). Start with the bench unit; add field units once it has run
+   through a trial. Deleting the file offers the image to every unit.
+5. Units pick it up at their next connection: at boot, after sending clips, or at the
+   daily check. Watch progress with `journalctl --user -t socksrvr -f` and
+   `cat ~/firmware/status/<id>` (version, battery, trial, rollbacks, `last_reset`).
+
+Notes:
+- Only units on 1.3.0 or later can update over the air. Older units need one USB or
+  SD-card update first.
+- The server offers by difference, not by "newer": putting an older signed image up makes
+  units install it. That is a deliberate way back from a bad release, but it means the
+  file on the server must always be the one intended.
+- To withdraw a release, delete `~/firmware/bird_watch.bin`; units are then told `NONE`.
+  A unit already part-way through a download resumes it only if the same image returns.
+
+## 6b. Testing a dropped download (test switch)
+
+`~/firmware/test_cutoff` holding a byte count (for example `300000`) makes the server
+stop sending at that byte, as if the connection had dropped. The unit logs
+`Download stopped at ... it resumes next time`; delete the file and the next connection
+resumes from that point. **Delete it after testing**: while it exists, no unit can
+complete a download.
+
 ## 7. Decisions (agreed 2026-11-11)
 
 1. Same port 3590 with a new signature.
@@ -150,3 +200,12 @@ the ESP-IDF v5.3.1 source:
 3. Signing key in `C:\Users\gardn\keys\`, outside the repo; backup on OneDrive,
    encrypted (password-protected archive or Personal Vault).
 4. Restart straight after a completed download.
+
+Later decisions (2026-11-12):
+5. The reporting task checks for firmware after sending all clips on every connection,
+   and connects once a day for the check even with no clips (`BW_OTA_CHECK_INTERVAL_MS`).
+6. The startup connection only syncs the time and checks for firmware; it does not send
+   clips, in testing or production.
+7. Clip names are exactly 22 bytes, checked by the unit (others are ignored) and by the
+   server. The server's `D_` exception stays until unit D_4c30, in a remote field, is
+   replaced.

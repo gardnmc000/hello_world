@@ -82,6 +82,16 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
     uint32_t bird_blocks = 0;
     /*  HIST_DEPTH defines the cut-off duration of the high frequency block within the clip  */
     max_volume = 0;
+    /*  The first call comes just after the startup connection, and its first block reads up to
+     *  ~3M (the modem powering down, and audio queued since boot). Scored, it would either seed
+     *  the noise floor far too high or, against the minimum floor, count as a bird. So the
+     *  first block after start-up is read and thrown away.                                  */
+    static bool first_call = true;
+    if (first_call) {
+        first_call = false;
+        i2s_channel_read(rx_handle, i2s_buff, bytes_to_read, (size_t *) &bytes_read, millis_to_wait);
+        ESP_LOGI(TAG, "Discarded the first audio block after start-up");
+    }
     /*  Idling overflows the DMA queue, leaving an old partial buffer ahead of newer audio.  */
     /*  Discard one DMA buffer so that join is never scored.                                 */
     i2s_channel_read(rx_handle, i2s_buff, 240 * sizeof(int32_t), (size_t *) &bytes_read, millis_to_wait);
