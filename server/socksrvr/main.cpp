@@ -50,7 +50,8 @@ static bool valid_clip_name(const char *name, int length)
 		}
 		return true;
 	}
-	if (name[0] != 'D' && name[0] != 'E') {
+	bool report = name[0] == 'S';
+	if (name[0] != 'D' && name[0] != 'E' && !report) {
 		return false;
 	}
 	for (int i = 1; i <= 6; i++) {
@@ -63,7 +64,55 @@ static bool valid_clip_name(const char *name, int length)
 			return false;
 		}
 	}
-	return memcmp(name + 18, ".wav", 4) == 0;
+	return memcmp(name + 18, report ? ".txt" : ".wav", 4) == 0;
+}
+
+/*  Status reports (firmware 1.5.2 on): "S" + the same id and timestamp as a clip +
+ *  ".txt", sent through the clip upload on every connection; see release.sh report.  */
+static bool is_report_name(const char *name)
+{
+	return name[0] == 'S';
+}
+
+/*  Uploads are stored per unit:
+ *    $BW_CLIPS_DIR/<id>/<clip>.wav             (default ~/clips)
+ *    $BW_CLIPS_DIR/<id>/reports/<report>.txt
+ *  The id is the 6 hex digits after the first letter of a checked name, or, for the
+ *  old "D_xxxx_..." names (D_4c30), the 4 characters after "D_". Folders are made
+ *  as needed, so a new unit gets its own the first time it sends anything.         */
+static bool upload_path(const char *name, char *out, size_t size)
+{
+	char id[8] = {0};
+	if (name[0] == 'D' && name[1] == '_') {
+		memcpy(id, name + 2, 4);
+	} else {
+		memcpy(id, name + 1, 6);
+	}
+	for (size_t i = 0; id[i] != '\0'; i++) {
+		if (!isalnum((unsigned char) id[i])) {
+			return false;
+		}
+	}
+
+	char base[400];
+	const char *dir = getenv("BW_CLIPS_DIR");
+	if (dir != NULL && dir[0] != '\0') {
+		snprintf(base, sizeof(base), "%s", dir);
+	} else {
+		const char *home = getenv("HOME");
+		snprintf(base, sizeof(base), "%s/clips", home != NULL ? home : ".");
+	}
+	mkdir(base, 0755);
+	int n = snprintf(out, size, "%s/%s", base, id);
+	mkdir(out, 0755);
+	if (is_report_name(name)) {
+		n = snprintf(out, size, "%s/%s/reports", base, id);
+		mkdir(out, 0755);
+		n = snprintf(out, size, "%s/%s/reports/%s", base, id, name);
+	} else {
+		n = snprintf(out, size, "%s/%s/%s", base, id, name);
+	}
+	return n > 0 && (size_t) n < size;
 }
 
 
@@ -75,7 +124,13 @@ static bool valid_clip_name(const char *name, int length)
  *                                   flags (u16: bit 0 on trial, bits 8-15 reset reason),
  *                                   rolled-back version[16]
  *                   FWH2 (72)       as FWH1 with "FWH2", then settings CRC (u32), refused (u8), 3 reserved
- *  server -> unit   (FWH2 only)     "CFG0" (current, or no config.cfg) | "CFG1", length (u16), text
+ *                   FWH3 (120)      firmware 1.5.1 only (1.5.2 went back to FWH2 and sends the network
+ *                                   in its status report); remove once no unit runs 1.5.1.
+ *                                   As FWH2 with "FWH3", and the mobile network found at registration:
+ *                                   byte 69 signal (AT+CSQ rssi, 0-31, 99 unknown), 70-71 reserved,
+ *                                   operator[20] (AT+COPS?), network code[8] (MCC+MNC), radio[20]
+ *                                   (technology and band, from AT+QNWINFO)
+ *  server -> unit   (FWH2, FWH3)    "CFG0" (current, or no config.cfg) | "CFG1", length (u16), text
  *  server -> unit   OFFER (72)      "NONE" | "OFFR", version[32], size (u32), sha256[32]
  *  unit -> server   GET (8)         "GET1", offset (u32)
  *  server -> unit   image bytes from offset to the end, then close
@@ -267,7 +322,7 @@ static long read_config(const char *dir, unsigned char *buf)
 
 static void write_status(const char *dir, const char *id, const char *ip, const char *version,
                          unsigned battery_mv, unsigned flags, const char *rolled_back,
-                         const char *config_line)
+                         const char *config_line, const char *network_line)
 {
 	char path[512];
 	snprintf(path, sizeof(path), "%s/status", dir);
@@ -286,21 +341,24 @@ static void write_status(const char *dir, const char *id, const char *ip, const 
 	}
 	fprintf(f, "time=%s\nip=%s\nversion=%s\nbattery_mv=%u\non_trial=%u\nrolled_back=%s\nlast_reset=%s\n",
 	        when, ip, version, battery_mv, flags & 1u, rolled_back, reset_reason_name(flags >> 8));
-	fprintf(f, "%s", config_line);
+	fprintf(f, "%s%s", config_line, network_line);
 	fclose(f);
 }
 
 static void handle_firmware(int fd, const char *ip)
 {
-	/*  FWH1 (64 bytes, firmware before 1.5.0) or FWH2 (72: adds the settings CRC)  */
-	unsigned char hello[FW_HELLO_LEN + 8];
+	/*  FWH1 (64 bytes, firmware before 1.5.0), FWH2 (72: adds the settings CRC) or
+	 *  FWH3 (120, from 1.5.1: adds the mobile network)  */
+	unsigned char hello[FW_HELLO_LEN + 56] = {0};
 	if (!recv_exact(fd, hello, FW_HELLO_LEN) ||
-	    (memcmp(hello, "FWH1", 4) != 0 && memcmp(hello, "FWH2", 4) != 0)) {
+	    (memcmp(hello, "FWH1", 4) != 0 && memcmp(hello, "FWH2", 4) != 0 && memcmp(hello, "FWH3", 4) != 0)) {
 		printf("FW %s: no valid HELLO\n", ip);
 		return;
 	}
-	bool fwh2 = memcmp(hello, "FWH2", 4) == 0;
-	if (fwh2 && !recv_exact(fd, hello + FW_HELLO_LEN, 8)) {
+	bool fwh3 = memcmp(hello, "FWH3", 4) == 0;
+	bool fwh2 = fwh3 || memcmp(hello, "FWH2", 4) == 0;     /*  Has the settings fields  */
+	size_t extra = fwh3 ? 56 : fwh2 ? 8 : 0;
+	if (extra > 0 && !recv_exact(fd, hello + FW_HELLO_LEN, extra)) {
 		printf("FW %s: incomplete HELLO\n", ip);
 		return;
 	}
@@ -320,6 +378,25 @@ static void handle_firmware(int fd, const char *ip)
 	       reset_reason_name(flags >> 8),
 	       (flags & 1u) ? ", on trial" : "",
 	       rolled_back[0] ? ", rolled back " : "", rolled_back);
+
+	/*  Mobile network (FWH3): CSQ rssi 0-31 is -113 dBm + 2 dBm per step; 99 is unknown  */
+	char network_line[200] = "";
+	if (fwh3) {
+		char op[24], plmn[12], radio[24], signal[32];
+		copy_field(op, sizeof(op), hello + 72, 20);
+		copy_field(plmn, sizeof(plmn), hello + 92, 8);
+		copy_field(radio, sizeof(radio), hello + 100, 20);
+		unsigned csq = hello[69];
+		if (csq <= 31) {
+			snprintf(signal, sizeof(signal), "%u/31 (%d dBm)", csq, -113 + 2 * (int) csq);
+		} else {
+			snprintf(signal, sizeof(signal), "unknown");
+		}
+		printf("FW %s: network %s (%s), %s, signal %s\n", id, op[0] ? op : "?", plmn[0] ? plmn : "?",
+		       radio[0] ? radio : "?", signal);
+		snprintf(network_line, sizeof(network_line), "network=%s\nnetwork_code=%s\nradio=%s\nsignal=%s\n",
+		         op, plmn, radio, signal);
+	}
 
 	char dir[400];
 	firmware_dir(dir, sizeof(dir));
@@ -344,7 +421,7 @@ static void handle_firmware(int fd, const char *ip)
 	if (cfg_len < 0) {
 		printf("FW %s: config.cfg is over %d bytes; not sent\n", id, CFG_MAX_TEXT);
 	}
-	write_status(dir, id, ip, version, battery_mv, flags, rolled_back, config_line);
+	write_status(dir, id, ip, version, battery_mv, flags, rolled_back, config_line, network_line);
 
 	if (fwh2) {
 		bool sent;
@@ -478,7 +555,7 @@ int main(void)
 	char sigbytes[8] = {0x19,0x57,0x55, 0xaa, 0xc0, 0x03,0xF0, 0x0f};
 	char outbuf[32];
 	int i, val;
-	char filename[64];
+	char filename[512];
 	bool connection_ok;
 
 	time_t rawtime;
@@ -700,8 +777,15 @@ int main(void)
 					close(new_fd);
 					exit(1);
 				}
-				memset(filename, 0, 64);
-				sprintf(filename, "%s", nambuf);
+				memset(filename, 0, sizeof(filename));
+				if (!upload_path(nambuf, filename, sizeof(filename))) {
+					printf("No storage path for %s\n", nambuf);
+					close(new_fd);
+					exit(1);
+				}
+				if (is_report_name(nambuf)) {
+					unlink(filename);      /*  A resent report replaces, never appends  */
+				}
 				printf("Filename is %s\r\n", filename);
 
 				if (send(new_fd, "GO", 2, 0) == -1) {
@@ -710,7 +794,7 @@ int main(void)
 						exit(1);
 				}
 
-				printf("Waiting for %s body\r\n", filename);
+				printf("Waiting for %s body\r\n", nambuf);
 				i = 0;
 				connection_ok = true;
 
@@ -721,7 +805,7 @@ int main(void)
 
 					if (val < 0) {
 						if (errno == EAGAIN || errno == EWOULDBLOCK) {
-								printf("Timeout reached reading file %s body.\n", filename);
+								printf("Timeout reached reading file %s body.\n", nambuf);
 						} else {
 								perror("recv body error");
 						}
@@ -744,7 +828,7 @@ int main(void)
 						break;
 					}
 					if ((i % 55) == 0) {
-						printf("%s:%03d\r\n", filename, i);
+						printf("%s:%03d\r\n", nambuf, i);
 					}
 				}
 
@@ -754,7 +838,7 @@ int main(void)
 					time(&rawtime);
 					loctim = localtime(&rawtime);
 					sprintf(sztime, "%04d/%02d/%02d %02d:%02d", loctim->tm_year+1900, loctim->tm_mon+1, loctim->tm_mday, loctim->tm_hour, loctim->tm_min);
-					printf("%s Received %d packets total for file %s\n\n", sztime, i, filename);
+					printf("%s Received %d packets total for file %s\n\n", sztime, i, nambuf);
 				}
 
 				// Guaranteed child cleanup

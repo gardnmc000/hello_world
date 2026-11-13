@@ -51,6 +51,10 @@ int settings_apply_text(const char *text, size_t length);
 uint32_t settings_crc(void);
 uint8_t  settings_rejected(void);
 
+/*  Writes every setting in use as "key=value" lines (those from the server marked),
+ *  for the status report. Returns the length written.                               */
+size_t settings_format(char *out, size_t size);
+
 /*  Standard CRC-32 (as zlib), shared with the server  */
 uint32_t settings_crc32(const void *data, size_t length);
 

@@ -6,6 +6,9 @@
 #include "esp_task_wdt.h"
 #include "ota_update.h"
 #include "bw_settings.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
 #include <time.h>
 
 SemaphoreHandle_t connection_sema = NULL; 
@@ -20,6 +23,7 @@ EventBits_t evt_flags;
 static const char *MAIN_TAG = "MODEM_APP";
 static bool sync_network_time(void);
 static bool make_clip_filename(void);
+static void send_status_report(int battery_mv);
 esp_modem_dce_t *dce = NULL;
 esp_netif_t * esp_netif = NULL;
 esp_modem_dte_config_t dte_config = ESP_MODEM_DTE_DEFAULT_CONFIG();
@@ -84,9 +88,11 @@ void app_main(void)
                 ESP_LOGW(MAIN_TAG, "Startup network time synchronization failed");
             }
 
-            /*  Report to the server and fetch any new firmware it offers. Sampling has
-             *  not started, so a restart here cannot cut a clip short.  */
-            if (ota_check_server(adc_val * 2)) {
+            send_status_report(adc_val * 2);
+
+            /*  Report to the server, take any new settings, and fetch any new firmware it
+             *  offers. Sampling has not started, so a restart here cannot cut a clip short.  */
+            if (ota_check_server(adc_val * 2, true) == OTA_CHECK_READY) {
                 graceful_power_down();
                 ESP_LOGI(MAIN_TAG, "Restarting to install the new firmware");
                 vTaskDelay(pdMS_TO_TICKS(500));
@@ -349,7 +355,14 @@ void reporting_task(void *pvParameters)
         esp_task_wdt_reset();
 
         sync_network_time();
+        send_status_report(battery_mv);
+        esp_task_wdt_reset();
+        /*  Settings before clips, so a long backlog never delays them; a firmware
+         *  download waits until after the clips, so an update never delays those  */
+        ota_check_t check = OTA_CHECK_WANTED;
         if (pending > 0) {
+            check = ota_check_server(battery_mv, false);
+            esp_task_wdt_reset();
             ESP_LOGI(MAIN_TAG, "Connected; sending pending recordings");
             if (!send_pending_files()) {
                 ESP_LOGW(MAIN_TAG, "Some recordings remain pending until the next hourly check");
@@ -357,8 +370,11 @@ void reporting_task(void *pvParameters)
         }
         esp_task_wdt_reset();
 
-        /*  Clips first, so an update never delays them  */
-        bool update_ready = ota_check_server(battery_mv);
+        /*  Back for the download only if one is worth having (or the first check failed)  */
+        if (check != OTA_CHECK_NOTHING) {
+            check = ota_check_server(battery_mv, true);
+        }
+        bool update_ready = (check == OTA_CHECK_READY);
         last_fw_check = xTaskGetTickCount();
         esp_task_wdt_reset();
         graceful_power_down();
@@ -423,6 +439,86 @@ bool measure_burst_sample(int count) {
   (void) count;
   /*  One block passing the bird test is enough, because a call can end partway through a burst  */
   return get_max_slope(rx_handle) >= 1;
+}
+
+static const char *reset_reason_text(esp_reset_reason_t reason)
+{
+    static const char *names[] = {
+        "unknown", "power-on", "reset pin", "software restart", "crash", "interrupt watchdog",
+        "task watchdog", "watchdog", "deep sleep wake", "brownout", "SDIO", "USB", "JTAG",
+        "eFuse error", "power glitch", "CPU lockup"
+    };
+    return (unsigned) reason < sizeof(names) / sizeof(names[0]) ? names[reason] : "unknown";
+}
+
+/*  Writes a status report and uploads it like a clip, as "S<id><yydddhhmmss>.txt"
+ *  (the server keeps these in ~/bin/reports), then deletes the local copy: the next
+ *  connection makes a fresh one. Call while PPP is up, after the time is set.     */
+static void send_status_report(int battery_mv)
+{
+    static char report[1536];       /*  Static: the startup task's stack is small  */
+    const esp_app_desc_t *app = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const bw_network_info_t *net = network_info();
+    char rolled_back[32];
+    ota_rolled_back_version(rolled_back, sizeof(rolled_back));
+
+    time_t now = time(NULL);
+    struct tm tm_now;
+    gmtime_r(&now, &tm_now);
+    char name[80], when[32];        /*  name: room for any int, checked for 22 bytes below  */
+    snprintf(name, sizeof(name), "S%s%02d%03d%02d%02d%02d.txt", &szmac_addr[6], tm_now.tm_year - 100,
+             tm_now.tm_yday, tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+    strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S GMT", &tm_now);
+    if (strlen(name) != BW_CLIP_NAME_LEN) {
+        ESP_LOGE(MAIN_TAG, "Status report name %s is not %d bytes; not sent", name, BW_CLIP_NAME_LEN);
+        return;
+    }
+
+    int len = snprintf(report, sizeof(report),
+        "# Bird Watch status report\n"
+        "time=%s\n"
+        "unit=%s\n"
+        "version=%s\n"
+        "partition=%s\n"
+        "on_trial=%d\n"
+        "rolled_back=%s\n"
+        "last_reset=%s\n"
+        "uptime_s=%lld\n"
+        "battery_mv=%d\n"
+        "battery_under_load_mv=%d\n"
+        "free_heap=%lu\n"
+        "\n# Network at this connection\n"
+        "network=%s\n"
+        "network_code=%s\n"
+        "radio=%s\n"
+        "signal_csq=%d\n"
+        "serving_cell=%s\n"
+        "\n# Settings (config CRC %08lx, %u refused)\n",
+        when, &szmac_addr[6], app->version, running ? running->label : "?", ota_on_trial() ? 1 : 0,
+        rolled_back, reset_reason_text(esp_reset_reason()), (long long) (xTaskGetTickCount() / configTICK_RATE_HZ),
+        battery_mv, battery_load_min_mv(), (unsigned long) esp_get_free_heap_size(),
+        net->operator_name, net->network_code, net->radio, net->csq, net->serving_cell,
+        (unsigned long) settings_crc(), (unsigned) settings_rejected());
+    if (len < 0 || len >= (int) sizeof(report)) {
+        ESP_LOGE(MAIN_TAG, "Status report too long; not sent");
+        return;
+    }
+    len += (int) settings_format(report + len, sizeof(report) - (size_t) len);
+
+    if (write_text_file(name, report, (size_t) len) != 0) {
+        return;
+    }
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(MAIN_TAG, "Unable to create socket: errno %d", errno);
+        sock = -1;
+    } else if (send_file(name) == BW_SEND_OK) {
+        ESP_LOGI(MAIN_TAG, "Status report %s sent (%d bytes)", name, len);
+    } else {
+        ESP_LOGW(MAIN_TAG, "Status report %s not sent; the next connection sends a new one", name);
+    }
+    delete_clip(name);
 }
 
 static bool make_clip_filename(void)

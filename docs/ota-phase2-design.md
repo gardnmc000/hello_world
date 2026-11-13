@@ -187,10 +187,12 @@ Notes:
 
 ## 6c. Unit settings (from 1.5.0)
 
-One file for every unit, `~/firmware/config.cfg`, of `key=value` lines; see
-`server/config.cfg.example` for every setting, its default and its range. Publish with
-`bash server/deploy/release.sh config <file>`, which checks each value against the
-firmware's own table (`main/bw_settings.c`) and sends only the settings, without comments.
+One file for every unit, of `key=value` lines. It is edited in one place only,
+`server/config.cfg` in the repository, which lists every setting with its default and its
+range (commented out = firmware default). `bash server/deploy/release.sh config` checks
+each value against the firmware's own table (`main/bw_settings.c`), lists every value
+beside the one on the server now, and if anything differs asks to publish. The server
+copy, `~/firmware/config.cfg`, gets only the settings, without comments.
 
 - Units on 1.5.0+ send `FWH2`: the HELLO gains the CRC-32 of the settings text they last
   applied and how many values they refused. When that CRC differs from `config.cfg`'s, the
@@ -204,6 +206,23 @@ firmware's own table (`main/bw_settings.c`) and sends only the settings, without
   allows at most 999 packets of 1024 bytes.
 - Active hours are GMT, the unit's clock. Outside them the sampler does not listen;
   reporting and firmware checks carry on.
+
+**Status report (from 1.5.2).** The HELLO stays FWH2 (battery and last reset are in it).
+Everything else goes in a status report, a short `key=value` text file the unit writes and
+uploads on every connection (startup and reporting), before any clips, through the clip
+upload. Its name is a clip name with `S` for `D` and `.txt` for `.wav`, for example
+`Sf30f1c26317171010.txt`. The server keeps reports in `~/clips/<id>/reports/`, beside that unit's
+clips in `~/clips/<id>/` (a resent report replaces, never appends), and the unit deletes its copy whether or
+not it was sent; the next connection makes a fresh one. The report holds: time, version,
+partition, trial, rolled-back version, last reset, uptime, battery at rest and under load,
+free memory, the network (operator from `AT+COPS?`; MCC+MNC, technology and band from
+`AT+QNWINFO`; signal from `AT+CSQ`), the raw `AT+QENG="servingcell"` reply (on trial
+until its format is confirmed, then parsed), and every setting, marked where it came from
+the server. See it with `release.sh report <id>` (the latest) or `release.sh report <id> 10`
+(a list); `release.sh status` names each unit's latest report.
+
+1.5.1 (bench unit only) sent the network in a 120-byte `FWH3` HELLO instead; the server
+still accepts it until no unit runs 1.5.1.
 
 ## 6b. Testing a dropped download (test switch)
 
@@ -224,6 +243,10 @@ complete a download.
 Later decisions (2026-11-12):
 5. The reporting task checks for firmware after sending all clips on every connection,
    and connects once a day for the check even with no clips (`BW_OTA_CHECK_INTERVAL_MS`).
+   From 1.5.1, a connection with clips to send checks first too, without downloading, so
+   new settings are never held up by a backlog. It comes back after the clips only if an
+   offer is worth downloading (or the first check failed). The server logs that first
+   check as `declined the offer` when there is one.
 6. The startup connection only syncs the time and checks for firmware; it does not send
    clips, in testing or production.
 7. Clip names are exactly 22 bytes, checked by the unit (others are ignored) and by the

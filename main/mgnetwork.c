@@ -50,8 +50,110 @@ static esp_err_t log_modem_status(const char *command)
 
 
 
+static bw_network_info_t s_network = {.csq = 99};
+
+const bw_network_info_t *network_info(void)
+{
+    return &s_network;
+}
+
+/*  Copies the index'th (from 0) double-quoted string in s to out; false if absent  */
+static bool quoted_field(const char *s, int index, char *out, size_t size)
+{
+    for (int i = 0; s != NULL; i++) {
+        const char *open = strchr(s, '"');
+        const char *close = open ? strchr(open + 1, '"') : NULL;
+        if (close == NULL) {
+            return false;
+        }
+        if (i == index) {
+            size_t len = (size_t) (close - open - 1);
+            if (len >= size) {
+                len = size - 1;
+            }
+            memcpy(out, open + 1, len);
+            out[len] = '\0';
+            return true;
+        }
+        s = close + 1;
+    }
+    return false;
+}
+
+/*  Asks the modem which network it registered on, and how strong the signal is.
+ *  Must run in command mode, before PPP starts. Failures only leave fields empty.  */
+static void read_network_info(void)
+{
+    char response[160];
+
+    memset(response, 0, sizeof(response));
+    if (esp_modem_at(dce, "AT+COPS?", response, 3000) == ESP_OK) {
+        /*  +COPS: 0,0,"EE",7  */
+        quoted_field(strstr(response, "+COPS:"), 0, s_network.operator_name, sizeof(s_network.operator_name));
+    }
+
+    memset(response, 0, sizeof(response));
+    if (esp_modem_at(dce, "AT+QNWINFO", response, 3000) == ESP_OK) {
+        /*  +QNWINFO: "FDD LTE","23430","LTE BAND 3",1617  */
+        const char *info = strstr(response, "+QNWINFO:");
+        char act[16] = "", band[24] = "";
+        quoted_field(info, 0, act, sizeof(act));
+        quoted_field(info, 1, s_network.network_code, sizeof(s_network.network_code));
+        quoted_field(info, 2, band, sizeof(band));
+        int band_no;
+        const char *b = strstr(band, "BAND ");
+        if (b != NULL && sscanf(b, "BAND %d", &band_no) == 1) {
+            snprintf(s_network.radio, sizeof(s_network.radio), "%.15s B%d", act, band_no);
+        } else {
+            snprintf(s_network.radio, sizeof(s_network.radio), "%.15s %.12s", act, band);
+        }
+    }
+
+    memset(response, 0, sizeof(response));
+    int rssi, ber;
+    const char *csq;
+    if (esp_modem_at(dce, "AT+CSQ", response, 3000) == ESP_OK &&
+        (csq = strstr(response, "+CSQ:")) != NULL && sscanf(csq, "+CSQ: %d,%d", &rssi, &ber) == 2) {
+        s_network.csq = rssi;
+    }
+
+    /*  TRIAL: the serving cell as the modem reports it, kept raw (on one line) until
+     *  the format of this EG915's reply is confirmed; then the useful fields can be parsed  */
+    static char cell[320];      /*  Static: the reply is long and some callers' stacks are small  */
+    memset(cell, 0, sizeof(cell));
+    esp_err_t cell_err = esp_modem_at(dce, "AT+QENG=\"servingcell\"", cell, 3000);
+    if (cell_err == ESP_OK) {
+        for (char *c = cell; *c; c++) {
+            if (*c == '\r' || *c == '\n') {
+                *c = ' ';
+            }
+        }
+        ESP_LOGI(MGNW_TAG, "Serving cell: %s", cell);
+        strlcpy(s_network.serving_cell, cell, sizeof(s_network.serving_cell));
+    } else {
+        ESP_LOGW(MGNW_TAG, "AT+QENG=\"servingcell\" failed: %s", esp_err_to_name(cell_err));
+        snprintf(s_network.serving_cell, sizeof(s_network.serving_cell), "failed: %s", esp_err_to_name(cell_err));
+    }
+
+    if (s_network.csq >= 0 && s_network.csq <= 31) {
+        ESP_LOGI(MGNW_TAG, "Network: %s (%s), %s, signal %d/31 (%d dBm)",
+                 s_network.operator_name[0] ? s_network.operator_name : "?",
+                 s_network.network_code[0] ? s_network.network_code : "?",
+                 s_network.radio[0] ? s_network.radio : "?", s_network.csq, -113 + 2 * s_network.csq);
+    } else {
+        ESP_LOGI(MGNW_TAG, "Network: %s (%s), %s, signal unknown",
+                 s_network.operator_name[0] ? s_network.operator_name : "?",
+                 s_network.network_code[0] ? s_network.network_code : "?",
+                 s_network.radio[0] ? s_network.radio : "?");
+    }
+}
+
 esp_err_t wait_for_cellular_ready(void)
 {
+    /*  Forget the last connection's network, so a stale one is never reported  */
+    memset(&s_network, 0, sizeof(s_network));
+    s_network.csq = 99;
+
     esp_err_t err = esp_modem_at(dce, "AT+CEREG=2", NULL, 3000);
     if (err != ESP_OK) {
         ESP_LOGE(MGNW_TAG, "Failed to enable detailed registration reports: %s",
@@ -102,6 +204,9 @@ esp_err_t wait_for_cellular_ready(void)
 
     if (battery_load_min_mv() > 0) {
         ESP_LOGI(MGNW_TAG, "Battery under modem load: lowest %d mV", battery_load_min_mv());
+    }
+    if (registered) {
+        read_network_info();
     }
 
     if (!registered) {

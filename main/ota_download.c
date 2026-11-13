@@ -17,7 +17,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-#define FW_HELLO_LEN    72              /*  FWH2: FWH1 (64) + settings CRC, refused count, 3 reserved  */
+#define FW_HELLO_LEN    72              /*  FWH2: FWH1 (64) + settings CRC, refused count, 3 reserved.
+                                            Everything else goes in the status report file.  */
 #define FW_OFFER_LEN    72
 #define FW_MAX_IMAGE    (3 * 1024 * 1024)       /*  One app partition  */
 #define DL_CHUNK        4096
@@ -180,7 +181,7 @@ static bool receive_image(int fd, const dl_info_t *info, uint32_t offset)
     return true;
 }
 
-bool ota_check_server(int battery_mv)
+ota_check_t ota_check_server(int battery_mv, bool download)
 {
     const esp_app_desc_t *app = esp_app_get_description();
     bool trial = ota_on_trial();
@@ -188,13 +189,13 @@ bool ota_check_server(int battery_mv)
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (fd < 0) {
         ESP_LOGE(DL_TAG, "Unable to create socket: errno %d", errno);
-        return false;
+        return OTA_CHECK_FAILED;
     }
     struct timeval io_timeout = {.tv_sec = 15, .tv_usec = 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
 
-    bool ready = false;
+    ota_check_t result = OTA_CHECK_FAILED;
     if (!connect_with_timeout(fd, (struct sockaddr *) &dest_addr, sizeof(dest_addr))) {
         ESP_LOGW(DL_TAG, "Unable to reach the server for the firmware check: errno %d", errno);
         goto done;
@@ -251,6 +252,8 @@ bool ota_check_server(int battery_mv)
         ESP_LOGW(DL_TAG, "Firmware check did not complete");
         goto done;
     }
+    /*  From here the conversation worked; anything that stops short is "nothing"  */
+    result = OTA_CHECK_NOTHING;
     if (memcmp(offer, "OFFR", 4) != 0) {
         ESP_LOGI(DL_TAG, "No new firmware on the server (running %s)", app->version);
         goto done;
@@ -284,6 +287,13 @@ bool ota_check_server(int battery_mv)
         ESP_LOGE(DL_TAG, "Offered image size %u is not plausible", (unsigned) want.size);
         goto done;
     }
+    if (!download) {
+        /*  Closing without a GET; the caller comes back for it after its clips  */
+        ESP_LOGI(DL_TAG, "Download of %s left until the recordings are sent", want.version);
+        result = OTA_CHECK_WANTED;
+        goto done;
+    }
+    result = OTA_CHECK_FAILED;      /*  Until the image is complete; a partial one resumes next time  */
 
     /*  Resume only if the partial file belongs to this exact offer  */
     dl_info_t have;
@@ -309,10 +319,10 @@ bool ota_check_server(int battery_mv)
             goto done;
         }
     }
-    ready = finish_download(&want);
+    result = finish_download(&want) ? OTA_CHECK_READY : OTA_CHECK_NOTHING;
 
 done:
     shutdown(fd, SHUT_RDWR);
     close(fd);
-    return ready;
+    return result;
 }

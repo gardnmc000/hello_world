@@ -32,6 +32,19 @@ esp_err_t   display_modem_state();
 
 esp_err_t wait_for_cellular_ready(void);
 
+/*  The mobile network found by the last successful registration, for the status
+ *  report sent on each connection. Empty strings and csq 99 when not known.         */
+typedef struct {
+    char operator_name[24];     /*  AT+COPS?, e.g. "EE"                              */
+    char network_code[8];       /*  MCC+MNC from AT+QNWINFO, e.g. "23430"            */
+    char radio[32];             /*  Technology and band from AT+QNWINFO, e.g. "FDD LTE B3"
+                                    (the HELLO carries the first 20 characters)        */
+    int csq;                    /*  AT+CSQ rssi: 0-31 (-113 dBm + 2 dBm per step), 99 unknown  */
+    char serving_cell[200];     /*  AT+QENG="servingcell" reply, raw, on one line    */
+} bw_network_info_t;
+
+const bw_network_info_t *network_info(void);
+
 
 
 #endif /* MGNETWORK_H_ */

@@ -442,6 +442,32 @@ int archive_clip(char * filename) {
 }
 
 
+/*  Writes a small text file (the status report) to the card's top folder  */
+int write_text_file(const char *filename, const char *text, size_t length) {
+  if (filename == NULL || text == NULL || strchr(filename, '/') != NULL || !lock_storage()) {
+    ESP_LOGE(STORAGE_TAG, "Invalid filename or unable to lock storage");
+    return -1;
+  }
+  char path[320];
+  int result = -1;
+  int n = snprintf(path, sizeof(path), "%s/%s", SD_MOUNT_POINT, filename);
+  if (n > 0 && n < (int)sizeof(path)) {
+    FILE *f = fopen(path, "wb");
+    if (f != NULL) {
+      bool ok = fwrite(text, 1, length, f) == length;
+      if (fclose(f) == 0 && ok) {
+        result = 0;
+      }
+    }
+    if (result != 0) {
+      ESP_LOGE(STORAGE_TAG, "Failed to write %s: errno %d", path, errno);
+      unlink(path);
+    }
+  }
+  unlock_storage();
+  return result;
+}
+
 int delete_clip(const char * filename) {
   if (filename == NULL || strchr(filename, '/') != NULL || !lock_storage()) {
     ESP_LOGE(STORAGE_TAG, "Invalid filename or unable to lock storage");

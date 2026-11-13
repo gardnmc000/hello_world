@@ -166,6 +166,26 @@ static void log_settings(const char *why)
     }
 }
 
+size_t settings_format(char *out, size_t size)
+{
+    bw_settings_t s = g_settings;
+    size_t used = 0;
+    if (size == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    for (size_t i = 0; i < NUM_DEFS && used < size; i++) {
+        double v = get_value(&s, &s_defs[i]);
+        bool is_default = fabs(v - s_defs[i].def) < 1e-6;
+        int n = snprintf(out + used, size - used, "%s=%g%s\n", s_defs[i].key, v, is_default ? "" : "   # from server");
+        if (n < 0) {
+            break;
+        }
+        used += (size_t) n;
+    }
+    return used < size ? used : size - 1;
+}
+
 void settings_init(void)
 {
     bw_settings_t s;

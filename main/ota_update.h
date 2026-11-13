@@ -41,10 +41,19 @@ void ota_rolled_back_version(char *out, size_t size);
 /*  True while the running firmware is on trial  */
 bool ota_on_trial(void);
 
-/*  Call while PPP is up. Reports this unit to the server and downloads any new
- *  firmware it offers to /sdcard/firmware.bin, resuming an earlier partial
- *  download. Returns true when a complete, verified image is ready: the caller
- *  should then shut the modem down and restart, so ota_install_from_sd() runs.  */
-bool ota_check_server(int battery_mv);
+typedef enum {
+    OTA_CHECK_FAILED,       /*  Server not reached, or the conversation broke off   */
+    OTA_CHECK_NOTHING,      /*  Nothing to download (none offered, or not taken)    */
+    OTA_CHECK_WANTED,       /*  An offer worth downloading; download was false      */
+    OTA_CHECK_READY,        /*  A complete, verified image is in /sdcard/firmware.bin  */
+} ota_check_t;
+
+/*  Call while PPP is up. Reports this unit to the server and applies any new settings
+ *  it sends. With download true, also downloads new firmware it offers to
+ *  /sdcard/firmware.bin, resuming an earlier partial download; with download false
+ *  it only says whether there is an offer worth downloading, so the caller can send
+ *  its clips first and then call again. On OTA_CHECK_READY the caller should shut
+ *  the modem down and restart, so ota_install_from_sd() runs.                       */
+ota_check_t ota_check_server(int battery_mv, bool download);
 
 #endif /* MAIN_OTA_UPDATE_H_ */

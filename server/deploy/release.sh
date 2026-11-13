@@ -16,14 +16,20 @@
 #   server/deploy/release.sh units --all [-y]
 #       Changes who is offered the current image, without changing the image.
 #
+#   server/deploy/release.sh report <unit-id> [count]
+#       Prints the unit's latest status report (firmware 1.5.2 on: network, serving cell,
+#       battery, settings...), or with a count, lists its latest reports. Reports are in
+#       ~/clips/<unit-id>/reports on the server, one per connection.
+#
 #   server/deploy/release.sh withdraw [-y]
 #       Removes the image; every unit is then told there is nothing new.
 #
-#   server/deploy/release.sh config <file.cfg> [-y]
-#       Publishes unit settings (see server/config.cfg.example). Every setting is
-#       checked against the names and ranges in main/bw_settings.c first. Units on
-#       1.5.0+ fetch it at their next connection. To put every unit back to its
-#       firmware defaults, publish a file with no settings in it (comments only).
+#   server/deploy/release.sh config [-y]
+#       Unit settings live in one file, server/config.cfg: edit it, then run this.
+#       It checks every setting against the names and ranges in main/bw_settings.c,
+#       lists every value beside the one on the server now and, if anything differs,
+#       asks to publish. Units on 1.5.0+ fetch it at their next connection. A setting
+#       left commented out takes the firmware default.
 #
 # Unit ids are the 6 MAC hex digits in a unit's clip names, e.g. f30f1c.
 
@@ -35,7 +41,9 @@ KEY=C:/Users/gardn/keys/bird_watch_signing.pem
 PYTHON=C:/Espressif/python_env/idf5.3_py3.11_env/Scripts/python.exe
 MAX_IMAGE=$((3 * 1024 * 1024))                    # one app partition
 MAX_CONFIG=1024                                   # BW_SETTINGS_MAX_TEXT in main/bw_settings.h
-SETTINGS_C="$(cd "$(dirname "$0")/../.." && pwd)/main/bw_settings.c"
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+SETTINGS_C="$REPO/main/bw_settings.c"
+CONFIG_FILE="$REPO/server/config.cfg"             # the one settings file
 
 die()  { echo "release: $*" >&2; exit 1; }
 note() { echo "== $*"; }
@@ -111,7 +119,13 @@ for f in status/*; do
                      (v["rolled_back"] == "" ? "" : "  rolled back " v["rolled_back"])
               if ("config_current" in v)
                   printf "           settings %s, current: %s%s\n", v["config"], v["config_current"],
-                         (v["config_refused"] + 0 > 0 ? ", " v["config_refused"] " value(s) REFUSED" : "") }' "$f"
+                         (v["config_refused"] + 0 > 0 ? ", " v["config_refused"] " value(s) REFUSED" : "")
+              if ("network" in v)
+                  printf "           network %s (%s), %s, signal %s\n",
+                         (v["network"] == "" ? "?" : v["network"]), (v["network_code"] == "" ? "?" : v["network_code"]),
+                         (v["radio"] == "" ? "?" : v["radio"]), v["signal"] }' "$f"
+    latest=$(ls -t ~/clips/"$(basename "$f")"/reports/S*.txt 2>/dev/null | head -1)
+    [ -n "$latest" ] && echo "           latest report $(basename "$latest") ($(stat -c %y "$latest" | cut -c1-16)); see: release.sh report $(basename "$f")"
 done
 EOF
 }
@@ -196,6 +210,19 @@ units)
     show_status
     ;;
 
+report)
+    [[ $# -ge 1 && $# -le 2 ]] || die "usage: release.sh report <unit-id> [count]"
+    check_ids "$1"
+    if [[ $# -eq 2 ]]; then
+        [[ "$2" =~ ^[0-9]+$ ]] || die "count must be a number"
+        remote "ls -lt --time-style=+'%Y-%m-%d %H:%M' ~/clips/$1/reports/S*.txt 2>/dev/null | head -$2 | awk '{print \$6, \$7, \$8}'" \
+            || die "no reports from $1"
+    else
+        remote "f=\$(ls -t ~/clips/$1/reports/S*.txt 2>/dev/null | head -1); [ -n \"\$f\" ] || exit 1; echo \"== \$(basename \$f)\"; cat \"\$f\"" \
+            || die "no reports from $1 (units send them from firmware 1.5.2)"
+    fi
+    ;;
+
 withdraw)
     confirm "Withdraw the image on offer? Every unit will be told there is nothing new."
     remote "rm -f ~/$FW_DIR/bird_watch.bin ~/$FW_DIR/bird_watch.new"
@@ -204,44 +231,71 @@ withdraw)
     ;;
 
 config)
-    [[ $# -eq 1 ]] || die "usage: release.sh config <file.cfg> [-y]"
-    cfg=$1
-    [[ -f "$cfg" ]] || die "no such file: $cfg"
+    [[ $# -eq 0 ]] || die "usage: release.sh config [-y]   (the settings are always in $CONFIG_FILE)"
+    [[ -f "$CONFIG_FILE" ]] || die "no $CONFIG_FILE in the repository"
     clean=$(mktemp)
-    trap 'rm -f "$clean"' EXIT
+    live=$(mktemp)
+    trap 'rm -f "$clean" "$live"' EXIT
+    have_live=1
+    remote "cat ~/$FW_DIR/config.cfg 2>/dev/null" > "$live" || have_live=0
 
-    # Check every setting against the firmware's own table of names and ranges, and
-    # write just the settings (no comments) to $clean: that is what units receive
-    note "Checking $cfg against $SETTINGS_C"
-    "$PYTHON" -I - "$cfg" "$SETTINGS_C" "$clean" <<'PY' || die "fix the settings above; nothing changed"
-import re, sys, math
-cfg_path, src_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    # Check every setting against the firmware's own table of names and ranges, write
+    # just the settings (no comments) to $clean, which is what units receive, and list
+    # every value beside the one on the server now
+    note "Checking $CONFIG_FILE against $SETTINGS_C"
+    "$PYTHON" -I - "$CONFIG_FILE" "$SETTINGS_C" "$clean" "$live" "$have_live" <<'PY' || die "fix the settings above; nothing changed"
+import re, sys, math, glob, os
+cfg_path, src_path, out_path, live_path, have_live = sys.argv[1:6]
+have_live = have_live == "1"
+# Numeric #defines from the firmware headers, so each setting's default expression
+# (e.g. BW_RECORD_INTERVAL / 1000) can be worked out the way the compiler does
+macros = {}
+for h in glob.glob(os.path.join(os.path.dirname(src_path), "*.h")):
+    for m in re.finditer(r'^\s*#define\s+(\w+)\s+([^\n]*?)\s*(?:/[/*].*)?$', open(h).read(), re.M):
+        macros[m.group(1)] = re.sub(r'(\d+(?:\.\d*)?)[fFuUlL]+\b', r'\1', m.group(2))
+def expand(expr, depth=0):
+    if depth > 5:
+        return "?"
+    return re.sub(r'\b[A-Z_][A-Z0-9_]*\b', lambda m: "(" + expand(macros.get(m.group(0), "?"), depth + 1) + ")", expr)
+def evaluate(expr):
+    e = expand(expr)
+    if not re.fullmatch(r'[\d.\s()+\-*/]+', e):
+        return None
+    try:
+        return float(eval(e, {"__builtins__": {}}))
+    except Exception:
+        return None
 table = {}
-for m in re.finditer(r'\{"(\w+)",\s*SET_(FLOAT|U32),\s*F\(\w+\),\s*[^,]+,\s*([-\d.]+),\s*([-\d.]+)\}', open(src_path).read()):
-    table[m.group(1)] = (m.group(2), float(m.group(3)), float(m.group(4)))
+for m in re.finditer(r'\{"(\w+)",\s*SET_(FLOAT|U32),\s*F\(\w+\),\s*([^,]+),\s*([-\d.]+),\s*([-\d.]+)\}', open(src_path).read()):
+    table[m.group(1)] = (m.group(2), float(m.group(4)), float(m.group(5)), evaluate(m.group(3).strip()))
 if not table:
     sys.exit("could not read the settings table from " + src_path)
-problems, values = [], {}
-for n, raw in enumerate(open(cfg_path, encoding="ascii", errors="replace"), 1):
-    line = raw.split("#", 1)[0].strip()
-    if not line:
-        continue
-    if "=" not in line:
-        problems.append(f"line {n}: no '=' in '{line}'"); continue
-    key, val = (p.strip() for p in line.split("=", 1))
-    if key not in table:
-        problems.append(f"line {n}: unknown setting '{key}' (known: {', '.join(table)})"); continue
-    kind, lo, hi = table[key]
-    try:
-        v = float(val)
-    except ValueError:
-        problems.append(f"line {n}: {key}={val} is not a number"); continue
-    if not math.isfinite(v) or v < lo or v > hi or (kind == "U32" and v != int(v)):
-        problems.append(f"line {n}: {key}={val} is outside {lo:g} to {hi:g}" + (" (whole numbers)" if kind == "U32" else "")); continue
-    values[key] = (val, v)
-s, e = values.get("active_start_hour", ("", 0))[1], values.get("active_end_hour", ("", 24))[1]
-if s == e:
-    problems.append(f"active_start_hour and active_end_hour are both {s:g}: that window is empty")
+
+def parse(path):
+    problems, values = [], {}
+    for n, raw in enumerate(open(path, encoding="ascii", errors="replace"), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            problems.append(f"line {n}: no '=' in '{line}'"); continue
+        key, val = (p.strip() for p in line.split("=", 1))
+        if key not in table:
+            problems.append(f"line {n}: unknown setting '{key}' (known: {', '.join(table)})"); continue
+        kind, lo, hi, _ = table[key]
+        try:
+            v = float(val)
+        except ValueError:
+            problems.append(f"line {n}: {key}={val} is not a number"); continue
+        if not math.isfinite(v) or v < lo or v > hi or (kind == "U32" and v != int(v)):
+            problems.append(f"line {n}: {key}={val} is outside {lo:g} to {hi:g}" + (" (whole numbers)" if kind == "U32" else "")); continue
+        values[key] = (val, v)
+    s, e = values.get("active_start_hour", ("", 0))[1], values.get("active_end_hour", ("", 24))[1]
+    if s == e:
+        problems.append(f"active_start_hour and active_end_hour are both {s:g}: that window is empty")
+    return problems, values
+
+problems, values = parse(cfg_path)
 for p in problems:
     print("  " + p)
 if problems:
@@ -251,13 +305,31 @@ if problems:
 # comment, which units apply as "everything at its default"
 text = "".join(f"{k}={val}\n" for k, (val, _) in values.items()) or "# all firmware defaults\n"
 open(out_path, "w", newline="\n").write(text)
-print("  " + (", ".join(f"{k}={val}" for k, (val, _) in values.items()) or "no settings: units go back to their firmware defaults"))
+live = parse(live_path)[1] if have_live else {}
+
+def shown(vals, k):
+    d = table[k][3]
+    return (f"{vals[k][1]:g}", "set") if k in vals else ("?" if d is None else f"{d:g}", "default")
+print()
+print(f"    {'setting':<22} {'this file':<19} {'server now' if have_live else 'server now: no settings file'}")
+changes = 0
+for k in table:
+    v, how = shown(values, k)
+    lv, lhow = shown(live, k)
+    differs = have_live and v != lv
+    changes += differs
+    right = f"{lv:<9} {lhow:<9}" if have_live else ""
+    print(f"    {k:<22} {v:<9} {how:<9} {right}" + ("<- changes" if differs else ""))
+print()
 PY
     size=$(stat -c %s "$clean")
     (( size <= MAX_CONFIG )) || die "the settings come to $size bytes; units accept at most $MAX_CONFIG"
+    if [[ $have_live == 1 ]] && cmp -s "$clean" "$live"; then
+        echo "The server already has these settings; nothing to publish."
+        exit 0
+    fi
     crc=$("$PYTHON" -I -c 'import sys, zlib; print("%08x" % zlib.crc32(open(sys.argv[1], "rb").read()))' "$clean")
-    echo
-    echo "Settings:   from $cfg ($size bytes as sent, CRC $crc)"
+    echo "Settings:   $size bytes as sent, CRC $crc"
     echo "Applies to: every unit on firmware 1.5.0 or later, at its next connection"
     echo
     confirm "Publish these settings?"
@@ -269,6 +341,6 @@ PY
     ;;
 
 *)
-    die "unknown command '$command' (status, publish, units, withdraw, config)"
+    die "unknown command '$command' (status, publish, units, report, withdraw, config)"
     ;;
 esac

@@ -31,6 +31,7 @@ int get_next_dir_entry_excluding(char * filename, const char (*skip)[BW_CLIP_NAM
 /*  Return the index number for use by the caller                                                                       */
 int archive_clip(char * filename);
 int delete_clip(const char * filename);
+int write_text_file(const char *filename, const char *text, size_t length);
 
 void close_data_socket(void);
 
