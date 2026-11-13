@@ -221,6 +221,15 @@ until its format is confirmed, then parsed), and every setting, marked where it 
 the server. See it with `release.sh report <id>` (the latest) or `release.sh report <id> 10`
 (a list); `release.sh status` names each unit's latest report.
 
+From 1.5.3 the serving cell is also decoded (confirmed format on this EG915, LTE:
+state, technology, duplex, MCC, MNC, cell id (hex), PCI, EARFCN, band, UL/DL bandwidth,
+TAC (hex), RSRP, RSRQ, RSSI, SINR, then one more) into `cell_...` lines, with the cell id
+and TAC also in decimal for cell databases, and `AT+QENG="neighbourcell"` is added as raw
+`neighbour=` lines (on trial). esp_modem keeps only the last line of a reply and cuts
+every reply at `CONFIG_ESP_MODEM_C_API_STR_MAX` bytes (raised from 128 to 1024 in
+`sdkconfig`); every AT call in `mgnetwork.c` goes through `modem_at()`, which receives
+into a buffer of that size, and multi-line replies use `modem_at_all_lines()`.
+
 1.5.1 (bench unit only) sent the network in a 120-byte `FWH3` HELLO instead; the server
 still accepts it until no unit runs 1.5.1.
 

@@ -15,10 +15,46 @@ extern SemaphoreHandle_t connection_sema;
 extern rep_state reporting_state;
 extern esp_netif_t * esp_netif;
 
+/*  Every AT command goes through these two. esp_modem copies each reply into the
+ *  caller's buffer assuming it holds CONFIG_ESP_MODEM_C_API_STR_MAX bytes (raised
+ *  to 1024 for the neighbour cell list), so the reply lands in a buffer of that
+ *  size first and is then copied into the caller's, cut to fit.                  */
+static esp_err_t modem_at_common(const char *cmd, char *out, size_t size, const char *pass,
+                                 const char *fail, int timeout_ms)
+{
+    if (out == NULL || size == 0) {
+        return pass ? esp_modem_at_raw(dce, cmd, NULL, pass, fail, timeout_ms)
+                    : esp_modem_at(dce, cmd, NULL, timeout_ms);
+    }
+    char *reply = calloc(1, CONFIG_ESP_MODEM_C_API_STR_MAX);
+    if (reply == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t err = pass ? esp_modem_at_raw(dce, cmd, reply, pass, fail, timeout_ms)
+                         : esp_modem_at(dce, cmd, reply, timeout_ms);
+    strlcpy(out, reply, size);
+    free(reply);
+    return err;
+}
+
+/*  A normal command: the reply's last line (esp_modem keeps only that)  */
+static esp_err_t modem_at(const char *cmd, char *out, size_t size, int timeout_ms)
+{
+    return modem_at_common(cmd, out, size, NULL, NULL, timeout_ms);
+}
+
+/*  The whole reply, every line, up to "OK" or "ERROR"  */
+static esp_err_t modem_at_all_lines(const char *cmd, char *out, size_t size, int timeout_ms)
+{
+    char line[64];
+    snprintf(line, sizeof(line), "%s\r", cmd);      /*  The raw call does not add the CR  */
+    return modem_at_common(line, out, size, "OK", "ERROR", timeout_ms);
+}
+
 static esp_err_t log_modem_status(const char *command)
 {
     char response[256] = {0};
-    esp_err_t err = esp_modem_at(dce, command, response, 3000);
+    esp_err_t err = modem_at(command, response, sizeof(response), 3000);
     if (err == ESP_OK) {
         ESP_LOGI(MGNW_TAG, "%s: %s", command, response);
     } else {
@@ -80,6 +116,119 @@ static bool quoted_field(const char *s, int index, char *out, size_t size)
     return false;
 }
 
+/*  Splits a "+QENG: ..." line at its commas, dropping quotes, into at most max fields
+ *  (pointers into buf, which is changed). Returns the number of fields.            */
+static int split_fields(char *buf, char *fields[], int max)
+{
+    char *p = strchr(buf, ':');
+    p = p ? p + 1 : buf;
+    int n = 0;
+    while (n < max) {
+        while (*p == ' ') {
+            p++;
+        }
+        char *end = strchr(p, ',');
+        if (end != NULL) {
+            *end = '\0';
+        }
+        size_t len = strlen(p);
+        while (len > 0 && (p[len - 1] == '\r' || p[len - 1] == '\n' || p[len - 1] == ' ')) {
+            p[--len] = '\0';
+        }
+        if (len >= 2 && p[0] == '"' && p[len - 1] == '"') {
+            p[len - 1] = '\0';
+            p++;
+        }
+        fields[n++] = p;
+        if (end == NULL) {
+            break;
+        }
+        p = end + 1;
+    }
+    return n;
+}
+
+/*  AT+QENG="servingcell" on this EG915 (LTE), confirmed 2026-11-13:
+ *  +QENG: "servingcell","NOCONN","LTE","FDD",234,30,80D701,359,1617,3,5,5,6627,-82,-5,-57,12,44
+ *          0             1        2     3     4   5  6      7   8    9 10 11 12  13  14 15  16 17
+ *  state, technology, duplex, MCC, MNC, cell id (hex), physical cell id, EARFCN, band,
+ *  UL and DL bandwidth, TAC (hex), RSRP, RSRQ, RSSI, SINR, then one more (srxlev?).  */
+static void read_serving_cell(void)
+{
+    char reply[256] = {0};
+    esp_err_t err = modem_at("AT+QENG=\"servingcell\"", reply, sizeof(reply), 3000);
+    if (err != ESP_OK) {
+        ESP_LOGW(MGNW_TAG, "AT+QENG=\"servingcell\" failed: %s", esp_err_to_name(err));
+        snprintf(s_network.serving_cell, sizeof(s_network.serving_cell), "failed: %s", esp_err_to_name(err));
+        return;
+    }
+    for (char *c = reply; *c; c++) {
+        if (*c == '\r' || *c == '\n') {
+            *c = ' ';
+        }
+    }
+    strlcpy(s_network.serving_cell, reply, sizeof(s_network.serving_cell));
+    ESP_LOGI(MGNW_TAG, "Serving cell: %s", reply);
+
+    char *f[20];
+    int n = split_fields(reply, f, 20);
+    bw_cell_t *c = &s_network.cell;
+    if (n >= 17 && strcmp(f[0], "servingcell") == 0 && strcmp(f[2], "LTE") == 0) {
+        c->mcc = atoi(f[4]);
+        c->mnc = atoi(f[5]);
+        c->cell_id = strtoul(f[6], NULL, 16);
+        c->pci = atoi(f[7]);
+        c->earfcn = atoi(f[8]);
+        c->band = atoi(f[9]);
+        c->tac = strtoul(f[12], NULL, 16);
+        c->rsrp = atoi(f[13]);
+        c->rsrq = atoi(f[14]);
+        c->rssi = atoi(f[15]);
+        c->sinr = atoi(f[16]);
+        c->valid = true;
+        ESP_LOGI(MGNW_TAG, "Cell %lX (mast %lu, sector %lu), TAC %lX, band %d, RSRP %d dBm, SINR %d dB",
+                 (unsigned long) c->cell_id, (unsigned long) (c->cell_id >> 8), (unsigned long) (c->cell_id & 0xff),
+                 (unsigned long) c->tac, c->band, c->rsrp, c->sinr);
+    } else {
+        ESP_LOGW(MGNW_TAG, "Serving cell reply not in the expected LTE format; kept raw only");
+    }
+}
+
+/*  TRIAL: AT+QENG="neighbourcell", one "+QENG:" line per cell heard, kept raw (one
+ *  per line) until the format of this EG915's reply is confirmed  */
+static void read_neighbour_cells(void)
+{
+    char *reply = calloc(1, CONFIG_ESP_MODEM_C_API_STR_MAX);
+    if (reply == NULL) {
+        return;
+    }
+    esp_err_t err = modem_at_all_lines("AT+QENG=\"neighbourcell\"", reply, CONFIG_ESP_MODEM_C_API_STR_MAX, 3000);
+    if (err != ESP_OK) {
+        ESP_LOGW(MGNW_TAG, "AT+QENG=\"neighbourcell\" failed: %s", esp_err_to_name(err));
+        snprintf(s_network.neighbours, sizeof(s_network.neighbours), "failed: %s\n", esp_err_to_name(err));
+        free(reply);
+        return;
+    }
+    /*  Keep only the "+QENG:" lines, each ending in '\n'  */
+    size_t used = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(reply, "\r\n", &save); line != NULL; line = strtok_r(NULL, "\r\n", &save)) {
+        if (strncmp(line, "+QENG:", 6) != 0) {
+            continue;
+        }
+        ESP_LOGI(MGNW_TAG, "Neighbour cell: %s", line);
+        int w = snprintf(s_network.neighbours + used, sizeof(s_network.neighbours) - used, "%s\n", line);
+        if (w < 0 || (size_t) w >= sizeof(s_network.neighbours) - used) {
+            ESP_LOGW(MGNW_TAG, "Neighbour cell list cut short");
+            break;
+        }
+        used += (size_t) w;
+        s_network.neighbour_count++;
+    }
+    ESP_LOGI(MGNW_TAG, "%d neighbour cell(s) heard", s_network.neighbour_count);
+    free(reply);
+}
+
 /*  Asks the modem which network it registered on, and how strong the signal is.
  *  Must run in command mode, before PPP starts. Failures only leave fields empty.  */
 static void read_network_info(void)
@@ -87,13 +236,13 @@ static void read_network_info(void)
     char response[160];
 
     memset(response, 0, sizeof(response));
-    if (esp_modem_at(dce, "AT+COPS?", response, 3000) == ESP_OK) {
+    if (modem_at("AT+COPS?", response, sizeof(response), 3000) == ESP_OK) {
         /*  +COPS: 0,0,"EE",7  */
         quoted_field(strstr(response, "+COPS:"), 0, s_network.operator_name, sizeof(s_network.operator_name));
     }
 
     memset(response, 0, sizeof(response));
-    if (esp_modem_at(dce, "AT+QNWINFO", response, 3000) == ESP_OK) {
+    if (modem_at("AT+QNWINFO", response, sizeof(response), 3000) == ESP_OK) {
         /*  +QNWINFO: "FDD LTE","23430","LTE BAND 3",1617  */
         const char *info = strstr(response, "+QNWINFO:");
         char act[16] = "", band[24] = "";
@@ -112,28 +261,13 @@ static void read_network_info(void)
     memset(response, 0, sizeof(response));
     int rssi, ber;
     const char *csq;
-    if (esp_modem_at(dce, "AT+CSQ", response, 3000) == ESP_OK &&
+    if (modem_at("AT+CSQ", response, sizeof(response), 3000) == ESP_OK &&
         (csq = strstr(response, "+CSQ:")) != NULL && sscanf(csq, "+CSQ: %d,%d", &rssi, &ber) == 2) {
         s_network.csq = rssi;
     }
 
-    /*  TRIAL: the serving cell as the modem reports it, kept raw (on one line) until
-     *  the format of this EG915's reply is confirmed; then the useful fields can be parsed  */
-    static char cell[320];      /*  Static: the reply is long and some callers' stacks are small  */
-    memset(cell, 0, sizeof(cell));
-    esp_err_t cell_err = esp_modem_at(dce, "AT+QENG=\"servingcell\"", cell, 3000);
-    if (cell_err == ESP_OK) {
-        for (char *c = cell; *c; c++) {
-            if (*c == '\r' || *c == '\n') {
-                *c = ' ';
-            }
-        }
-        ESP_LOGI(MGNW_TAG, "Serving cell: %s", cell);
-        strlcpy(s_network.serving_cell, cell, sizeof(s_network.serving_cell));
-    } else {
-        ESP_LOGW(MGNW_TAG, "AT+QENG=\"servingcell\" failed: %s", esp_err_to_name(cell_err));
-        snprintf(s_network.serving_cell, sizeof(s_network.serving_cell), "failed: %s", esp_err_to_name(cell_err));
-    }
+    read_serving_cell();
+    read_neighbour_cells();
 
     if (s_network.csq >= 0 && s_network.csq <= 31) {
         ESP_LOGI(MGNW_TAG, "Network: %s (%s), %s, signal %d/31 (%d dBm)",
@@ -154,7 +288,7 @@ esp_err_t wait_for_cellular_ready(void)
     memset(&s_network, 0, sizeof(s_network));
     s_network.csq = 99;
 
-    esp_err_t err = esp_modem_at(dce, "AT+CEREG=2", NULL, 3000);
+    esp_err_t err = modem_at("AT+CEREG=2", NULL, 0, 3000);
     if (err != ESP_OK) {
         ESP_LOGE(MGNW_TAG, "Failed to enable detailed registration reports: %s",
                  esp_err_to_name(err));
@@ -174,7 +308,7 @@ esp_err_t wait_for_cellular_ready(void)
         int reporting_mode;
         int registration_status;
 
-        err = esp_modem_at(dce, "AT+CEREG?", response, 3000);
+        err = modem_at("AT+CEREG?", response, sizeof(response), 3000);
         char *registration = strstr(response, "+CEREG:");
 
         if (err == ESP_OK && registration != NULL &&
@@ -237,7 +371,7 @@ esp_err_t wait_for_cellular_ready(void)
         char response[128] = {0};
         int attached = 0;
 
-        err = esp_modem_at(dce, "AT+CGATT?", response, 3000);
+        err = modem_at("AT+CGATT?", response, sizeof(response), 3000);
         char *attachment = strstr(response, "+CGATT:");
 
         if (err == ESP_OK && attachment != NULL &&
@@ -300,7 +434,7 @@ esp_err_t configure_quectel_eg915(esp_modem_dce_t *dce, esp_netif_t *esp_netif)
     // 4. Enable Roaming via Quectel-specific AT command configuration
     // Corrected to exactly 4 parameters: dce, command string, response buffer, timeout
     // Using NULL because we only care if the modem returns ESP_OK or a timeout/error
-    err = esp_modem_at(dce, "AT+QCFG=\"roamservice\",2", NULL, 1000);
+    err = modem_at("AT+QCFG=\"roamservice\",2", NULL, 0, 1000);
     if (err != ESP_OK) {
         ESP_LOGE(MGNW_TAG, "Failed to enable roaming via AT command: %s", esp_err_to_name(err));
         return err;
@@ -477,7 +611,7 @@ void ensure_modem_off(void) {
 
 static bool send_modem_power_off(void) {
     ESP_LOGI(MGNW_TAG, "Sending AT+QPOWD...");
-    if (esp_modem_at(dce, "AT+QPOWD=1", NULL, 5000) != ESP_OK) {
+    if (modem_at("AT+QPOWD=1", NULL, 0, 5000) != ESP_OK) {
         return false;
     }
     ESP_LOGI(MGNW_TAG, "Modem safely powered down via software.");
@@ -532,7 +666,7 @@ void check_modem_down(void) {
         ESP_LOGI(MGNW_TAG, "Modem is SYNCED and responding to AT.");
         vTaskDelay(pdMS_TO_TICKS(500)); // Allow AT interface to settle
         ESP_LOGI(MGNW_TAG, "Sending AT+QPOWD...");
-        esp_err_t err = esp_modem_at(dce, "AT+QPOWD=1", NULL, 5000);
+        esp_err_t err = modem_at("AT+QPOWD=1", NULL, 0, 5000);
         
         if (err == ESP_OK) {
             ESP_LOGI(MGNW_TAG, "Modem safely powered down.");
@@ -584,7 +718,7 @@ esp_err_t upgrade_modem_baud_rate(void)
 
     /* Querying the setting at the new rate also checks that communication works. */
     char response[128] = {0};
-    err = esp_modem_at(dce, "AT+IPR?", response, 2000);
+    err = modem_at("AT+IPR?", response, sizeof(response), 2000);
     if (err != ESP_OK) {
         ESP_LOGE(MGNW_TAG, "Modem did not respond at baud rate %d: %s",
                  TARGET_BAUD_RATE, esp_err_to_name(err));

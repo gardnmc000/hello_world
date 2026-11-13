@@ -456,7 +456,7 @@ static const char *reset_reason_text(esp_reset_reason_t reason)
  *  connection makes a fresh one. Call while PPP is up, after the time is set.     */
 static void send_status_report(int battery_mv)
 {
-    static char report[1536];       /*  Static: the startup task's stack is small  */
+    static char report[3072];       /*  Static: the startup task's stack is small  */
     const esp_app_desc_t *app = esp_app_get_description();
     const esp_partition_t *running = esp_ota_get_running_partition();
     const bw_network_info_t *net = network_info();
@@ -493,13 +493,50 @@ static void send_status_report(int battery_mv)
         "network_code=%s\n"
         "radio=%s\n"
         "signal_csq=%d\n"
-        "serving_cell=%s\n"
-        "\n# Settings (config CRC %08lx, %u refused)\n",
+        "serving_cell=%s\n",
         when, &szmac_addr[6], app->version, running ? running->label : "?", ota_on_trial() ? 1 : 0,
         rolled_back, reset_reason_text(esp_reset_reason()), (long long) (xTaskGetTickCount() / configTICK_RATE_HZ),
         battery_mv, battery_load_min_mv(), (unsigned long) esp_get_free_heap_size(),
-        net->operator_name, net->network_code, net->radio, net->csq, net->serving_cell,
-        (unsigned long) settings_crc(), (unsigned) settings_rejected());
+        net->operator_name, net->network_code, net->radio, net->csq, net->serving_cell);
+
+    /*  The serving cell, decoded. cell_id and tac in hex as the modem gives them, and
+     *  in decimal as cell databases (e.g. OpenCellID) list them.  */
+    const bw_cell_t *c = &net->cell;
+    if (len > 0 && len < (int) sizeof(report) && c->valid) {
+        len += snprintf(report + len, sizeof(report) - (size_t) len,
+            "cell_mcc=%d\n"
+            "cell_mnc=%d\n"
+            "cell_id=%lX (%lu; mast %lu, sector %lu)\n"
+            "cell_tac=%lX (%lu)\n"
+            "cell_pci=%d\n"
+            "cell_earfcn=%d\n"
+            "cell_band=%d\n"
+            "cell_rsrp_dbm=%d\n"
+            "cell_rsrq_db=%d\n"
+            "cell_rssi_dbm=%d\n"
+            "cell_sinr_db=%d\n",
+            c->mcc, c->mnc, (unsigned long) c->cell_id, (unsigned long) c->cell_id,
+            (unsigned long) (c->cell_id >> 8), (unsigned long) (c->cell_id & 0xff),
+            (unsigned long) c->tac, (unsigned long) c->tac, c->pci, c->earfcn, c->band,
+            c->rsrp, c->rsrq, c->rssi, c->sinr);
+    }
+
+    /*  Neighbour cells, raw (on trial), one line each  */
+    if (len > 0 && len < (int) sizeof(report)) {
+        len += snprintf(report + len, sizeof(report) - (size_t) len, "neighbour_count=%d\n", net->neighbour_count);
+    }
+    const char *line = net->neighbours;
+    while (*line && len > 0 && len < (int) sizeof(report)) {
+        const char *end = strchr(line, '\n');
+        int line_len = end ? (int) (end - line) : (int) strlen(line);
+        len += snprintf(report + len, sizeof(report) - (size_t) len, "neighbour=%.*s\n", line_len, line);
+        line = end ? end + 1 : line + line_len;
+    }
+
+    if (len > 0 && len < (int) sizeof(report)) {
+        len += snprintf(report + len, sizeof(report) - (size_t) len, "\n# Settings (config CRC %08lx, %u refused)\n",
+                        (unsigned long) settings_crc(), (unsigned) settings_rejected());
+    }
     if (len < 0 || len >= (int) sizeof(report)) {
         ESP_LOGE(MAIN_TAG, "Status report too long; not sent");
         return;
