@@ -7,6 +7,7 @@
 #include "base.h"
 #include "bw_settings.h"
 #include "ota_update.h"
+#include "battery_guard.h"
 #include "nvs.h"
 #include <ctype.h>
 #include <math.h>
@@ -48,6 +49,9 @@ static const setting_def_t s_defs[] = {
     {"reporting_interval_s", SET_U32,   F(reporting_interval_s), BW_REPORTING_INTERVAL_MS / 1000, 60,  86400},
     {"fw_check_interval_h",  SET_U32,   F(fw_check_interval_h),  BW_OTA_CHECK_INTERVAL_MS / 3600000, 1,  168},
     {"ota_min_battery_mv",   SET_U32,   F(ota_min_battery_mv),   BW_OTA_MIN_BATTERY_MV,        3300,    4000},
+    {"low_battery_mv",       SET_U32,   F(low_battery_mv),       BW_LOW_BATTERY_MV,            3000,    3800},
+    {"resume_battery_mv",    SET_U32,   F(resume_battery_mv),    BW_RESUME_BATTERY_MV,         3300,    4150},
+    {"low_battery_sleep_s",  SET_U32,   F(low_battery_sleep_s),  BW_LOW_BATTERY_SLEEP_S,        300,   21600},
 };
 #define NUM_DEFS (sizeof(s_defs) / sizeof(s_defs[0]))
 
@@ -150,6 +154,16 @@ static int parse_text(const char *text, size_t length, bw_settings_t *s, bool lo
                           (unsigned) s->active_start_hour, (unsigned) s->active_end_hour);
         s->active_start_hour = BW_ACTIVE_START_HOUR;
         s->active_end_hour = BW_ACTIVE_END_HOUR;
+        rejected++;
+    }
+
+    /*  Without a gap the unit would wake, start, and fall straight back to sleep  */
+    if (s->resume_battery_mv < s->low_battery_mv + 100) {
+        if (log) ESP_LOGE(SET_TAG, "Refused low/resume battery %u/%u mV (resume must be at least 100 mV higher); "
+                          "using %u/%u mV", (unsigned) s->low_battery_mv, (unsigned) s->resume_battery_mv,
+                          (unsigned) BW_LOW_BATTERY_MV, (unsigned) BW_RESUME_BATTERY_MV);
+        s->low_battery_mv = BW_LOW_BATTERY_MV;
+        s->resume_battery_mv = BW_RESUME_BATTERY_MV;
         rejected++;
     }
     return rejected;

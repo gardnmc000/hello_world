@@ -32,6 +32,9 @@ typedef struct {
     uint32_t reporting_interval_s;      /*  Time between reporting checks  */
     uint32_t fw_check_interval_h;       /*  Connect for a firmware check at least this often  */
     uint32_t ota_min_battery_mv;        /*  No firmware download or install below this  */
+    uint32_t low_battery_mv;            /*  Below this the unit stops and deep sleeps...  */
+    uint32_t resume_battery_mv;         /*  ...until the battery is back above this  */
+    uint32_t low_battery_sleep_s;       /*  Time between battery checks while asleep  */
 } bw_settings_t;
 
 /*  The settings in force. Written only by settings_apply_text(); every user reads it

@@ -12,13 +12,32 @@
 #include "esp_psram.h"
 #include "base.h"
 #include "bw_settings.h"
+#include "driver/i2s_pdm.h"
 
 
+#if MIC_IS_PDM
 
-i2s_std_config_t config = {
+/*  PDM microphone (IM73D122V01).  At 44.1 kHz the mic clock is 64 x 44.1k = 2.82 MHz.
+ *  The S3's converter gives 16-bit PCM, which mic_read() widens to the I2S layout.    */
+static i2s_pdm_rx_config_t config = {
+    .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(CONFIG_EXAMPLE_SAMPLE_RATE),
+    .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {
+        .clk = CONFIG_I2S_BCK_PIN,
+        .din = CONFIG_I2S_DATA_PIN,
+        .invert_flags = {
+            .clk_inv = false,
+        },
+    },
+};
+
+#else
+
+/*  I2S microphone (ICS-43434)  */
+static i2s_std_config_t config = {
     .clk_cfg = {
         .clk_src = I2S_CLK_SRC_DEFAULT,
-        .sample_rate_hz = 44100,
+        .sample_rate_hz = CONFIG_EXAMPLE_SAMPLE_RATE,
         .mclk_multiple = I2S_MCLK_MULTIPLE_256
     },
     .gpio_cfg = {
@@ -47,6 +66,8 @@ i2s_std_config_t config = {
     }
 };
 
+#endif
+
 static const char *TAG = "AUDIO";
 int32_t i2s_buff[SAMPLE_BUFFER_SIZE];
 uint16_t * p_out_buff;
@@ -55,9 +76,58 @@ uint8_t right_shift = 10;
 /*  @brief  Initialise and enable the I2S Channel  */
 void i2s_start(i2s_chan_handle_t rx_handle) {
     /* Initialise the channel */
+#if MIC_IS_PDM
+    config.slot_cfg.slot_mask = MIC_PDM_SLOT;
+    esp_err_t err = i2s_channel_init_pdm_rx_mode(rx_handle, &config);
+    ESP_LOGI(TAG, "PDM microphone selected: %s", esp_err_to_name(err));
+#else
     i2s_channel_init_std_mode(rx_handle, &config);
+#endif
     /* Before reading data, start the RX channel first */
     i2s_channel_enable(rx_handle);
+}
+
+/*  @brief  Reads up to max_samples samples into buf as 32-bit words, whichever microphone is fitted.
+ *          The I2S mic's data is used as is.  The PDM mic's 16-bit PCM has its DC offset removed,
+ *          as the S3 has no high-pass filter in its converter, and is scaled to the I2S layout.  */
+static esp_err_t mic_read(i2s_chan_handle_t rx_handle, int32_t *buf, size_t max_samples,
+                          size_t *samples_read, uint32_t millis_to_wait) {
+    size_t bytes_read = 0;
+#if MIC_IS_PDM
+    int16_t *pcm = (int16_t *) buf;
+    esp_err_t err = i2s_channel_read(rx_handle, pcm, max_samples * sizeof(int16_t), &bytes_read, millis_to_wait);
+    size_t samples = bytes_read / sizeof(int16_t);
+
+    /*  One-pole DC blocker, cut-off ~20 Hz at 44.1 kHz.  Its state runs on between reads  */
+    static float x_prev = 0, y_prev = 0;
+    const float pole = 0.99715f;
+    const float scale = (float) (1u << MIC_PDM_GAIN_SHIFT);
+
+    /*  Widen in place from the top down, so no 16-bit sample is overwritten before it is read,
+     *  then filter from the bottom up.                                                       */
+    for (size_t i = samples; i-- > 0; ) {
+        buf[i] = (int32_t) pcm[i];
+    }
+    for (size_t i = 0; i < samples; i++) {
+        float x = (float) buf[i];
+        float y = x - x_prev + pole * y_prev;
+        x_prev = x;
+        y_prev = y;
+        float out = y * scale;
+        /*  Clip at full scale; the filter can overshoot a full-scale step slightly  */
+        if (out > 2147483520.0f) {
+            out = 2147483520.0f;
+        } else if (out < -2147483520.0f) {
+            out = -2147483520.0f;
+        }
+        buf[i] = (int32_t) out;
+    }
+#else
+    esp_err_t err = i2s_channel_read(rx_handle, buf, max_samples * sizeof(int32_t), &bytes_read, millis_to_wait);
+    size_t samples = bytes_read / sizeof(int32_t);
+#endif
+    *samples_read = samples;
+    return err;
 }
 
 /*  @brief  Absolute difference of two samples, computed unsigned so a full-scale swing cannot overflow  */
@@ -73,9 +143,8 @@ static inline uint32_t abs_i32(int32_t a) {
 /*  @brief  Scans the cI2S buffer contents and accumulates the number of high frequency portions of sound  */
 uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
 
-    /*  Required number of bytes per sample is 4 times the number of samples, as the i2s output is 32 bits  */
-    uint32_t bytes_to_read = SAMPLE_BUFFER_SIZE * sizeof(int32_t);
-    uint32_t bytes_read = 0, samples_read = 0, slope =0, max_slope = 0, attempt = 0, accum_slope = 0, max_volume = 0;
+    size_t samples_read = 0;
+    uint32_t slope =0, max_slope = 0, attempt = 0, accum_slope = 0, max_volume = 0;
     int32_t millis_to_wait = 20,  cur_magnitude = 0,  prv_magnitude = 0;
     int  index;
     /*  Tracked background level, kept between calls.  Zero until the first block has been measured  */
@@ -90,18 +159,17 @@ uint32_t get_max_slope(i2s_chan_handle_t rx_handle)  {
     static bool first_call = true;
     if (first_call) {
         first_call = false;
-        i2s_channel_read(rx_handle, i2s_buff, bytes_to_read, (size_t *) &bytes_read, millis_to_wait);
+        mic_read(rx_handle, i2s_buff, SAMPLE_BUFFER_SIZE, &samples_read, millis_to_wait);
         ESP_LOGI(TAG, "Discarded the first audio block after start-up");
     }
     /*  Idling overflows the DMA queue, leaving an old partial buffer ahead of newer audio.  */
     /*  Discard one DMA buffer so that join is never scored.                                 */
-    i2s_channel_read(rx_handle, i2s_buff, 240 * sizeof(int32_t), (size_t *) &bytes_read, millis_to_wait);
+    mic_read(rx_handle, i2s_buff, 240, &samples_read, millis_to_wait);
     for (attempt = 0; attempt < HIST_DEPTH; attempt ++) {
         max_slope = 0;
         uint32_t peak_index = 0;
         /*  read the entire contents of the I2S device buffer (typically 4096 32-bit words)  */
-        i2s_channel_read(rx_handle, i2s_buff, bytes_to_read, (size_t *) &bytes_read, millis_to_wait);
-        samples_read = bytes_read / sizeof(int32_t);
+        mic_read(rx_handle, i2s_buff, SAMPLE_BUFFER_SIZE, &samples_read, millis_to_wait);
         /*  Compare each element in the sample with the previous element in the sample to determine the slope  */
         for (index=1; index < samples_read; index++) {                  
             cur_magnitude = i2s_buff[index];
@@ -208,14 +276,12 @@ void analyse_block(const int32_t *buf, uint32_t samples, float *slope_rms, float
 /*  @brief  Builds an entire 16 bit PCM wav file  */
 void build_clip16(i2s_chan_handle_t rx_handle, const char * filespec)  {
 
-    /*  Required number of bytes per sample is 4 times the number of samples, as the i2s output is 32 bits  */
-    uint32_t bytes_to_read = SAMPLE_BUFFER_SIZE * sizeof(int32_t);
-    uint32_t bytes_read = 0;
+    size_t samples_read = 0;
     int32_t millis_to_wait = 20;
     int counter = 0,  clip_size;
     bool read_active = true;
     /*  Typically = 4096 / 44100 = 0.0928 seconds or 10.8 samples per second  */
-    float seconds_per_sample = (float) ((float) SAMPLE_BUFFER_SIZE / config.clk_cfg.sample_rate_hz);
+    float seconds_per_sample = (float) ((float) SAMPLE_BUFFER_SIZE / CONFIG_EXAMPLE_SAMPLE_RATE);
     /*  Typically 5 seconds; set by the server's clip_length_s  */
     float required_clip_length = (float) g_settings.clip_length_s;
     /*  Typically  = 54 ( 5 seconds * 10.8 = 53.8 rounded up)  */
@@ -242,13 +308,13 @@ void build_clip16(i2s_chan_handle_t rx_handle, const char * filespec)  {
     /*  Capture nn blocks from the I2S interface  */
     while (read_active) {
         /*  read from the I2S device and immediately write to the RAM as is  */
-        err = i2s_channel_read(rx_handle, i2s_buff, bytes_to_read, (size_t *) &bytes_read, millis_to_wait);
+        err = mic_read(rx_handle, i2s_buff, SAMPLE_BUFFER_SIZE, &samples_read, millis_to_wait);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to read from I2S: %s", esp_err_to_name(err));
             break;
         }
-        if (bytes_read != bytes_to_read) {
-            ESP_LOGE(TAG, "Bytes Read:  %08d", (int) bytes_read);
+        if (samples_read != SAMPLE_BUFFER_SIZE) {
+            ESP_LOGE(TAG, "Samples Read:  %08d", (int) samples_read);
         }
         
         /*  Transcode the entire block from 32-bit to 16-bit on the fly.*/

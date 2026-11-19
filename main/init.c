@@ -45,7 +45,12 @@ void esp32_init() {
   unsigned char mac[16];
   int i;
 
+#if MIC_IS_PDM
+  /*  Only I2S0 has the PDM to PCM converter  */
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+#else
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+#endif
   i2s_new_channel(&chan_cfg, NULL, &rx_handle);
 
   /*  Enable pull-ups for SPI lines for the SD card.  */

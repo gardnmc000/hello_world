@@ -6,6 +6,7 @@
 #include "esp_task_wdt.h"
 #include "ota_update.h"
 #include "bw_settings.h"
+#include "battery_guard.h"
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
@@ -54,6 +55,9 @@ void app_main(void)
 
     /*  After ota_boot_check, which starts NVS: the settings last sent by the server  */
     settings_init();
+
+    /*  Before anything loads the battery: sleeps instead if it is too low to start  */
+    battery_guard_boot();
 
     /* Global Core Subsystems Initialization (Run ONCE at boot) */
     esp32_init();
@@ -268,6 +272,10 @@ static bool sync_network_time(void)
  *  restarts the unit between samples, so a clip being saved is never cut short.  */
 static volatile bool s_restart_for_update = false;
 
+/*  Set by the reporting task when the battery is low (0 otherwise). The sampler then
+ *  sleeps between samples, for the same reason.                                       */
+static volatile int s_sleep_for_battery_mv = 0;
+
 void reporting_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -298,8 +306,16 @@ void reporting_task(void *pvParameters)
             remaining -= wait;
         }
 
-        if (s_restart_for_update) {
-            continue;   /*  Waiting for the sampler to restart the unit  */
+        if (s_restart_for_update || s_sleep_for_battery_mv) {
+            continue;   /*  Waiting for the sampler to restart the unit or put it to sleep  */
+        }
+
+        /*  Every cycle, connecting or not, and before the modem loads the battery  */
+        int battery_mv = battery_guard_read_mv();
+        if (battery_guard_is_low(battery_mv) && !ota_on_trial()) {
+            ESP_LOGW(MAIN_TAG, "Battery %d mV is low; sleeping between samples", battery_mv);
+            s_sleep_for_battery_mv = battery_mv;
+            continue;
         }
 
         char filename[256];
@@ -324,8 +340,6 @@ void reporting_task(void *pvParameters)
             last_fw_check = xTaskGetTickCount();
         }
 
-        /*  Read the battery before the modem loads it  */
-        int battery_mv = read_adc_voltage_gpio8() * 2;
         if (ensure_modem_on() != ESP_OK) {
             ESP_LOGE(MAIN_TAG, "Modem is not ready; will retry at the next hourly check");
             graceful_power_down();
@@ -401,6 +415,11 @@ void handle_dev_state(void *pvParameters)
             ESP_LOGI(MAIN_TAG, "Restarting to install the new firmware");
             vTaskDelay(pdMS_TO_TICKS(500));   /*  Let the log drain  */
             esp_restart();
+        }
+        if (s_sleep_for_battery_mv) {
+            /*  Between clips, and the modem was powered down after the last connection  */
+            battery_guard_sleep(s_sleep_for_battery_mv);
+            s_sleep_for_battery_mv = 0;     /*  Only reached while the firmware is on trial  */
         }
 
         /*  Outside the recording window nothing is sampled; reporting carries on  */
@@ -531,6 +550,13 @@ static void send_status_report(int battery_mv)
         int line_len = end ? (int) (end - line) : (int) strlen(line);
         len += snprintf(report + len, sizeof(report) - (size_t) len, "neighbour=%.*s\n", line_len, line);
         line = end ? end + 1 : line + line_len;
+    }
+
+    if (len > 0 && len < (int) sizeof(report)) {
+        len += snprintf(report + len, sizeof(report) - (size_t) len, "\n# Low battery (since the power was last connected)\n");
+    }
+    if (len > 0 && len < (int) sizeof(report)) {
+        len += (int) battery_guard_format(report + len, sizeof(report) - (size_t) len);
     }
 
     if (len > 0 && len < (int) sizeof(report)) {

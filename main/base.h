@@ -115,6 +115,22 @@ typedef enum    REPORTING_STATE {
 //#define CONFIG_I2S_DATA_PIN 27
 //#define CONFIG_I2S_BCK_PIN 26
 
+/*  Microphone type, chosen at build time:
+ *    0 = I2S microphone (ICS-43434): BCK, LRCK and DATA
+ *    1 = PDM microphone (IM73D122V01): CLK on the BCK pin, DATA on the DATA pin, LRCK unused.
+ *        Tie the mic's SEL pin to match MIC_PDM_SLOT below.                                   */
+#define MIC_IS_PDM 0
+
+/*  PDM only: which clock edge the mic drives data on, set by its SEL pin.
+ *  If clips are silent, swap to I2S_PDM_SLOT_RIGHT.                       */
+#define MIC_PDM_SLOT I2S_PDM_SLOT_LEFT
+
+/*  PDM only: the 16-bit PCM is moved into the top of a 32-bit word, which puts it on the
+ *  same scale as the ICS-43434's 24-bit data, so the detection settings carry over. If the
+ *  IM73D122's sensitivity differs from the ICS-43434's -26 dBFS, correct it here
+ *  (6 dB per step: 17 doubles the level, 15 halves it).                              */
+#define MIC_PDM_GAIN_SHIFT 16
+
 /*  MIC pins  for ESP32-S3  */
 #define CONFIG_I2S_LRCK_PIN 38
 #define CONFIG_I2S_DATA_PIN 3
